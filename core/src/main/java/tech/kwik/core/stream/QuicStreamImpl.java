@@ -45,6 +45,8 @@ public class QuicStreamImpl implements QuicStream {
     private final StreamOutputStream outputStream;
     private volatile boolean outputClosed;
     private volatile boolean inputClosed;
+    private volatile StreamReadListener readListener;
+    private final java.util.concurrent.atomic.AtomicBoolean readClosedFired = new java.util.concurrent.atomic.AtomicBoolean(false);
     private final ReentrantLock stateLock;
 
 
@@ -243,6 +245,27 @@ public class QuicStreamImpl implements QuicStream {
         }
         finally {
             stateLock.unlock();
+        }
+        fireReadClosed();
+    }
+
+    @Override
+    public void setReadListener(StreamReadListener listener) {
+        this.readListener = listener;
+    }
+
+    StreamReadListener getReadListener() {
+        return readListener;
+    }
+
+    void fireReadClosed() {
+        StreamReadListener listener = this.readListener;
+        if (listener != null && readClosedFired.compareAndSet(false, true)) {
+            try {
+                listener.onClosed(this);
+            } catch (Throwable ignored) {
+                // listener bug; receive loop must continue
+            }
         }
     }
 }

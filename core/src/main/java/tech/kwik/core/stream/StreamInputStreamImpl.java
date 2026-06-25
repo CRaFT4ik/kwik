@@ -94,19 +94,53 @@ class StreamInputStreamImpl extends StreamInputStream {
         }
 
         if (!aborted && !closed && !reset) {
+            long largestOffsetIncrease;
             synchronized (addMonitor) {
                 if (frame.getUpToOffset() > receiverFlowControlLimit) {
                     log.error("Flow control error on stream " + quicStream.streamId + ": frame up to offset " + frame.getUpToOffset() + " exceeds flow control limit " + receiverFlowControlLimit);
                     throw new TransportError(FLOW_CONTROL_ERROR);
                 }
                 receiveBuffer.add(frame);
-                long largestOffsetIncrease = Long.max(0, frame.getUpToOffset() - largestOffsetReceived);
+                largestOffsetIncrease = Long.max(0, frame.getUpToOffset() - largestOffsetReceived);
                 largestOffsetReceived = Long.max(largestOffsetReceived, frame.getUpToOffset());
                 addMonitor.notifyAll();
-                return largestOffsetIncrease;
             }
+            // Non-blocking signal: listener (if any) wakes its drain coroutine.
+            // MUST be invoked outside the addMonitor to keep the receive loop responsive
+            // and prevent a misbehaving listener from blocking other streams.
+            StreamReadListener listener = quicStream.getReadListener();
+            if (listener != null) {
+                try {
+                    listener.onDataAvailable(quicStream);
+                } catch (Throwable ignored) {
+                    // listener bug; receive loop must continue
+                }
+            }
+            return largestOffsetIncrease;
         }
         else {
+            return 0;
+        }
+    }
+
+    @Override
+    public int readAvailable(ByteBuffer dst) throws IOException {
+        if (aborted || closed || reset) {
+            throw new StreamClosedException(aborted ? "Connection closed" : closed ? "Stream closed" : "Stream reset by peer");
+        }
+        if (!dst.hasRemaining()) {
+            return 0;
+        }
+        synchronized (addMonitor) {
+            int bytesRead = receiveBuffer.read(dst);
+            if (bytesRead > 0) {
+                updateAllowedFlowControl(bytesRead);
+                return bytesRead;
+            } else if (bytesRead < 0) {
+                // Clean EOF, mirror the blocking-read path.
+                allDataRead();
+                return -1;
+            }
             return 0;
         }
     }
@@ -150,6 +184,7 @@ class StreamInputStreamImpl extends StreamInputStream {
     // - If requested number of bytes is greater than zero, an attempt is done to read at least one byte.
     // - If no byte is available because the stream is at end of file, the value -1 is returned;
     //   otherwise, at least one byte is read and stored into the given byte array.
+    // Non-blocking equivalent: readAvailable(ByteBuffer).
     @Override
     public int read(byte[] buffer, int offset, int len) throws IOException {
         if (len == 0) {
@@ -283,6 +318,17 @@ class StreamInputStreamImpl extends StreamInputStream {
             quicStream.updateConnectionFlowControl(unusedFlowControlCredits);
             receiveBuffer.discardAllData();
             interruptBlockingReader();
+            // Notify event-driven listener (if any) BEFORE the inputClosed callback, so the
+            // observed ordering is onReset -> onClosed. Swallow listener exceptions: a bug in
+            // the listener must not break the receive loop or the connection-level state.
+            StreamReadListener listener = quicStream.getReadListener();
+            if (listener != null) {
+                try {
+                    listener.onReset(quicStream, errorCode);
+                } catch (Throwable ignored) {
+                    // listener bug; receive loop must continue
+                }
+            }
             quicStream.inputClosed();
         }
         return increment;

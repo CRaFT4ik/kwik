@@ -52,4 +52,10 @@ public class NullStreamInputStream extends StreamInputStream {
     public int read() throws IOException {
         return -1;
     }
+
+    @Override
+    public int readAvailable(java.nio.ByteBuffer dst) throws IOException {
+        // No-receive stream: behaves like immediate EOF, mirroring read().
+        return -1;
+    }
 }

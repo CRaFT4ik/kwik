@@ -113,4 +113,28 @@ public interface QuicStream {
     default void closeInput(long applicationProtocolErrorCode) {
         abortReading(applicationProtocolErrorCode);
     }
+
+    /**
+     * Registers a non-blocking read listener for opt-in event-driven consumption.
+     * <p>
+     * When a listener is set, the kwik receive loop invokes
+     * {@link StreamReadListener#onDataAvailable(QuicStream)} on data arrival,
+     * {@link StreamReadListener#onReset(QuicStream, long)} on peer RESET_STREAM, and
+     * {@link StreamReadListener#onClosed(QuicStream)} on the receive side closing (clean EOF or
+     * local abort). The application drains bytes via
+     * {@link tech.kwik.core.stream.StreamInputStream#readAvailable(java.nio.ByteBuffer)} from a
+     * thread of its choosing, never blocking a thread per stream.
+     * <p>
+     * Blocking {@link java.io.InputStream#read} on {@link #getInputStream()} continues to work
+     * independently and is the default when no listener is attached. The blocking and event
+     * paths can be mixed (e.g. blocking handshake, then event-driven data plane).
+     * <p>
+     * Default implementation throws {@link UnsupportedOperationException}; the production
+     * implementation overrides it. A {@code null} listener detaches.
+     *
+     * @param listener the listener to attach, or {@code null} to detach.
+     */
+    default void setReadListener(tech.kwik.core.stream.StreamReadListener listener) {
+        throw new UnsupportedOperationException("setReadListener not supported by this implementation");
+    }
 }
