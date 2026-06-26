@@ -29,6 +29,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Instant;
 import java.util.concurrent.ScheduledExecutorService;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -132,6 +133,20 @@ class IdleTimerTest {
 
         // Then
         verify(connection).silentlyCloseConnection(anyLong());
+    }
+
+
+    @Test
+    void getLastActionTimeReflectsLatestRestartingEvent() {
+        // Given
+        idleTimer.setIdleTimeout(200);
+        Instant beforeReceive = clock.instant();
+        clock.fastForward(50);
+        idleTimer.packetProcessed();
+        Instant afterReceive = idleTimer.getLastActionTime();
+
+        // Then
+        assertThat(afterReceive).isAfter(beforeReceive);
     }
 
 }

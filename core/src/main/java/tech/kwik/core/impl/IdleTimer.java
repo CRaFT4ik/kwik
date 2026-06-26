@@ -135,6 +135,19 @@ public class IdleTimer {
         }
     }
 
+    /**
+     * Returns the timestamp of the last action that restarted this timer.
+     *
+     * The returned instant moves forward on every successfully processed incoming packet and,
+     * subject to the RFC 9000 section 10.1 rule, on ack-eliciting sends. Intended for diagnostics
+     * such as exporting the time since the last observed peer activity.
+     *
+     * @return monotonically non-decreasing instant on the configured clock; never null.
+     */
+    public Instant getLastActionTime() {
+        return lastActionTime;
+    }
+
     public void shutdown() {
         if (enabled) {
             timer.shutdown();
