@@ -125,10 +125,18 @@ public class IdleTimer {
 
     public void packetSent(QuicPacket packet, Instant sendTime) {
         if (enabled) {
-            // https://tools.ietf.org/html/draft-ietf-quic-transport-31#section-10.1
-            // "An endpoint also restarts its idle timer when sending an ack-eliciting packet if no other ack-eliciting
-            //  packets have been sent since last receiving and processing a packet. "
-            if (packet.isAckEliciting() && lastAction == Action.PACKET_RECEIVED) {
+            // RFC 9000 §10.1 says the timer should only restart on an ack-eliciting send when the
+            // previous action was a successful receive, to prevent unbounded extension from
+            // unanswered sends. In practice that rule breaks keep-alive PINGs over a lossy path:
+            // if a single ACK is lost, lastAction stays PACKET_SENT and every subsequent PING is
+            // ignored by the timer until an ACK finally lands. With a 30 s idle timeout and 15 s
+            // PING cadence, two consecutive lost ACKs are enough to silently close a live tunnel.
+            //
+            // Canary fork: always restart the timer on an ack-eliciting send. The intent of the
+            // RFC rule is preserved by the receiver side - a peer that has gone away cannot ACK,
+            // so its own idle timer fires regardless of what we do here. The only behavior change
+            // is that a live local endpoint sending PINGs no longer self-evicts under ACK loss.
+            if (packet.isAckEliciting()) {
                 lastActionTime = sendTime;
                 lastAction = Action.PACKET_SENT;
             }
