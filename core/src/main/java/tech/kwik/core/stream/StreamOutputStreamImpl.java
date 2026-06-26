@@ -28,6 +28,7 @@ import tech.kwik.core.log.Logger;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static tech.kwik.core.common.EncryptionLevel.App;
@@ -123,6 +124,19 @@ class StreamOutputStreamImpl extends StreamOutputStream implements FlowControlUp
     }
 
     @Override
+    public int writeAvailable(ByteBuffer src) throws IOException {
+        checkState();
+        if (!src.hasRemaining()) {
+            return 0;
+        }
+        int accepted = sendBuffer.writeAvailable(src);
+        if (accepted > 0) {
+            scheduleSendStreamFrameRequest(true);
+        }
+        return accepted;
+    }
+
+    @Override
     public void write(int dataByte) throws IOException {
         // Terrible for performance of course, but that is calling this method anyway.
         byte[] data = new byte[]{(byte) dataByte};
@@ -206,6 +220,13 @@ class StreamOutputStreamImpl extends StreamOutputStream implements FlowControlUp
         if (streamFrame != null && (sendBuffer.hasData() || retransmitBuffer.hasDataToRetransmit())) {
             // There is more to send, so queue a new send request.
             scheduleSendStreamFrameRequest(true);
+        }
+
+        // Non-blocking signal: a frame was just drained out of the send buffer, so any caller
+        // parked on writeAvailable can try again. Edge-triggered, may be coalesced. Invoked outside
+        // the SendBuffer lock so a misbehaving listener cannot block the sender loop.
+        if (streamFrame != null && !streamFrame.isFinal()) {
+            quicStream.fireWritable();
         }
 
         return streamFrame;
@@ -293,6 +314,10 @@ class StreamOutputStreamImpl extends StreamOutputStream implements FlowControlUp
             // Use sender callback to ensure current offset used in reset frame is accessed by sender thread.
             quicStream.connection.send(this::createResetFrame, ResetStreamFrame.getMaximumFrameSize(quicStream.streamId, errorCode), App, this::retransmitResetFrame, true);
             interruptBlockingThread();
+            // Fire onWriteReset BEFORE outputClosed: the latter calls fireWriteClosed which uses
+            // the same fired flag, so the listener observes onWriteReset (the terminal cause) and
+            // not onWriteClosed.
+            quicStream.fireWriteReset(errorCode);
             quicStream.outputClosed();
         }
     }
@@ -320,5 +345,9 @@ class StreamOutputStreamImpl extends StreamOutputStream implements FlowControlUp
     void abort() {
         aborted = true;
         interruptBlockingThread();
+        // Fire write-close on connection-level abort so a non-blocking caller suspended on the
+        // wakeup channel observes EOF instead of hanging. Reuses the close-fired flag with
+        // fireWriteClosed: if reset/clean-close already fired, this is a no-op.
+        quicStream.fireWriteClosed();
     }
 }

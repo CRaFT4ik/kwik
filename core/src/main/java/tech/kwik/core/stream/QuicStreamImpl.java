@@ -47,6 +47,8 @@ public class QuicStreamImpl implements QuicStream {
     private volatile boolean inputClosed;
     private volatile StreamReadListener readListener;
     private final java.util.concurrent.atomic.AtomicBoolean readClosedFired = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile StreamWriteListener writeListener;
+    private final java.util.concurrent.atomic.AtomicBoolean writeClosedFired = new java.util.concurrent.atomic.AtomicBoolean(false);
     private final ReentrantLock stateLock;
 
 
@@ -233,6 +235,7 @@ public class QuicStreamImpl implements QuicStream {
         finally {
             stateLock.unlock();
         }
+        fireWriteClosed();
     }
 
     void inputClosed() {
@@ -265,6 +268,48 @@ public class QuicStreamImpl implements QuicStream {
                 listener.onClosed(this);
             } catch (Throwable ignored) {
                 // listener bug; receive loop must continue
+            }
+        }
+    }
+
+    @Override
+    public void setWriteListener(StreamWriteListener listener) {
+        this.writeListener = listener;
+    }
+
+    StreamWriteListener getWriteListener() {
+        return writeListener;
+    }
+
+    void fireWritable() {
+        StreamWriteListener listener = this.writeListener;
+        if (listener != null) {
+            try {
+                listener.onWritable(this);
+            } catch (Throwable ignored) {
+                // listener bug; sender loop must continue
+            }
+        }
+    }
+
+    void fireWriteClosed() {
+        StreamWriteListener listener = this.writeListener;
+        if (listener != null && writeClosedFired.compareAndSet(false, true)) {
+            try {
+                listener.onWriteClosed(this);
+            } catch (Throwable ignored) {
+                // listener bug; sender loop must continue
+            }
+        }
+    }
+
+    void fireWriteReset(long errorCode) {
+        StreamWriteListener listener = this.writeListener;
+        if (listener != null && writeClosedFired.compareAndSet(false, true)) {
+            try {
+                listener.onWriteReset(this, errorCode);
+            } catch (Throwable ignored) {
+                // listener bug; sender loop must continue
             }
         }
     }

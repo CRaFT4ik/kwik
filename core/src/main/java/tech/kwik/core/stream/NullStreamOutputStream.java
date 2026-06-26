@@ -42,4 +42,10 @@ public class NullStreamOutputStream extends StreamOutputStream {
     public void write(int b) throws IOException {
         throw new IOException("Stream is not writable");
     }
+
+    @Override
+    public int writeAvailable(java.nio.ByteBuffer src) throws IOException {
+        // No-send stream: behaves like a closed sink, mirroring write().
+        throw new IOException("Stream is not writable");
+    }
 }

@@ -138,6 +138,35 @@ public class SendBuffer {
         return streamFrame;
     }
 
+    /**
+     * Offers as many bytes from {@code src} as fit into the buffer immediately, without blocking.
+     * <p>
+     * Returns the number of bytes consumed (which may be {@code 0} when the buffer is full).
+     * Mirrors the blocking {@link #write(byte[], int, int)} path except that it never waits on
+     * {@link #notFull}: callers that get less than they wanted register for the
+     * {@link StreamWriteListener#onWritable(tech.kwik.core.QuicStream)} signal and retry.
+     *
+     * @param src source buffer; bytes are consumed starting at its current position and the
+     *            position is advanced by the number of bytes accepted.
+     * @return bytes consumed from {@code src} (0 when the buffer is currently full).
+     */
+    public int writeAvailable(ByteBuffer src) {
+        int wanted = src.remaining();
+        if (wanted == 0) {
+            return 0;
+        }
+        int availableBufferSpace = maxBufferSize - bufferedBytes.get();
+        if (availableBufferSpace <= 0) {
+            return 0;
+        }
+        int toAccept = Math.min(wanted, availableBufferSpace);
+        byte[] copy = new byte[toAccept];
+        src.get(copy);
+        sendQueue.add(ByteBuffer.wrap(copy));
+        bufferedBytes.getAndAdd(toAccept);
+        return toAccept;
+    }
+
     public int getAvailableBytes() {
         return bufferedBytes.get();
     }

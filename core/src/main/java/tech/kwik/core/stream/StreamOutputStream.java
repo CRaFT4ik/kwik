@@ -18,10 +18,12 @@
  */
 package tech.kwik.core.stream;
 
+import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 
 public abstract class StreamOutputStream extends OutputStream {
-    
+
     abstract void reset(long errorCode);
 
     protected abstract void resetOutputStream();
@@ -29,4 +31,24 @@ public abstract class StreamOutputStream extends OutputStream {
     protected abstract void stopFlowControl();
 
     abstract void abort();
+
+    /**
+     * Offers as many bytes from {@code src} as fit into the stream's send buffer immediately,
+     * without blocking. Returns the number of bytes consumed (which may be {@code 0} when the
+     * buffer is full; the caller then waits for
+     * {@link StreamWriteListener#onWritable(tech.kwik.core.QuicStream)} and retries).
+     * <p>
+     * When the returned value is positive, the source buffer's position has advanced by that many
+     * bytes (mirroring channel/buffer write semantics).
+     * <p>
+     * Equivalent to a single non-blocking {@code write} call: never sleeps, never waits on a
+     * monitor, never throws on a full buffer. Throws {@link IOException} only on terminal states
+     * (stream closed locally, reset locally, or aborted because the connection died).
+     *
+     * @param src source buffer; bytes are read starting at its current position and the position
+     *            is advanced by the number of bytes accepted.
+     * @return bytes consumed from {@code src} (0 when the send buffer is currently full).
+     * @throws IOException if the stream is no longer accepting writes.
+     */
+    public abstract int writeAvailable(ByteBuffer src) throws IOException;
 }

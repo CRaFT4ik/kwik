@@ -137,4 +137,30 @@ public interface QuicStream {
     default void setReadListener(tech.kwik.core.stream.StreamReadListener listener) {
         throw new UnsupportedOperationException("setReadListener not supported by this implementation");
     }
+
+    /**
+     * Registers a non-blocking write listener for opt-in event-driven flow control on the send side.
+     * <p>
+     * When a listener is set, the kwik sender path invokes
+     * {@link tech.kwik.core.stream.StreamWriteListener#onWritable(QuicStream)} whenever bytes drain
+     * out of the stream's send buffer (so a caller that previously could not enqueue all bytes may
+     * try again), {@link tech.kwik.core.stream.StreamWriteListener#onWriteClosed(QuicStream)} when
+     * the send side terminates cleanly, and
+     * {@link tech.kwik.core.stream.StreamWriteListener#onWriteReset(QuicStream, long)} on local
+     * RESET_STREAM. The application offers bytes via
+     * {@link tech.kwik.core.stream.StreamOutputStream#writeAvailable(java.nio.ByteBuffer)}
+     * (non-blocking; returns the number of bytes accepted by the send buffer, possibly 0).
+     * <p>
+     * Blocking {@link java.io.OutputStream#write} on {@link #getOutputStream()} continues to work
+     * independently and is the default when no listener is attached. The blocking and event paths
+     * can be mixed and are byte-identical when no listener is registered.
+     * <p>
+     * Default implementation throws {@link UnsupportedOperationException}; the production
+     * implementation overrides it. A {@code null} listener detaches.
+     *
+     * @param listener the listener to attach, or {@code null} to detach.
+     */
+    default void setWriteListener(tech.kwik.core.stream.StreamWriteListener listener) {
+        throw new UnsupportedOperationException("setWriteListener not supported by this implementation");
+    }
 }
