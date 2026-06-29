@@ -46,6 +46,12 @@ public class IdleTimer {
     private final Logger log;
     private volatile IntSupplier ptoSupplier;
     private volatile Instant lastActionTime;
+    // Canary fork: pure peer-receive timestamp. Updated only when an incoming packet is processed
+    // successfully (packetProcessed); never bumped by our own ack-eliciting sends. Used by the
+    // application-level watchdog as a second liveness signal alongside Statistics.latestRtt so a
+    // peer that is alive-but-slow (sender bottleneck, no fresh ACK sample yet) is not falsely
+    // declared dead while datagrams are still arriving.
+    private volatile Instant lastIncomingPacketTime;
     private volatile boolean enabled;
     private volatile Action lastAction;
     private ScheduledFuture<?> timerTask;
@@ -68,6 +74,7 @@ public class IdleTimer {
 
         timer = createScheduler();
         lastActionTime = clock.instant();
+        lastIncomingPacketTime = lastActionTime;
         lastAction = Action.PACKET_RECEIVED;  // Initial state is like a packet was received (no tail loss).
     }
 
@@ -138,7 +145,9 @@ public class IdleTimer {
         if (enabled) {
             // https://tools.ietf.org/html/draft-ietf-quic-transport-31#section-10.1
             // "An endpoint restarts its idle timer when a packet from its peer is received and processed successfully."
-            lastActionTime = clock.instant();
+            Instant now = clock.instant();
+            lastActionTime = now;
+            lastIncomingPacketTime = now;
             lastAction = Action.PACKET_RECEIVED;
         }
     }
@@ -174,6 +183,22 @@ public class IdleTimer {
      */
     public Instant getLastActionTime() {
         return lastActionTime;
+    }
+
+    /**
+     * Returns the timestamp of the last incoming packet that this endpoint processed successfully.
+     *
+     * Unlike {@link #getLastActionTime()}, this value is never advanced by our own ack-eliciting
+     * sends; it bumps only inside {@link #packetProcessed()}. That makes it a pure peer-receive
+     * signal: if it stays frozen, no datagram of any kind (ack, stream data, ping ack) has arrived
+     * from the peer since that instant. Intended for an application-level watchdog that needs to
+     * distinguish "peer dead, no traffic at all" from "peer alive but slow to ACK" (sender
+     * bottleneck, transient congestion).
+     *
+     * @return monotonically non-decreasing instant on the configured clock; never null.
+     */
+    public Instant getLastIncomingPacketTime() {
+        return lastIncomingPacketTime;
     }
 
     public void shutdown() {

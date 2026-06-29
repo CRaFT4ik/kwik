@@ -157,4 +157,34 @@ class IdleTimerTest {
         assertThat(afterReceive).isAfter(beforeReceive);
     }
 
+    @Test
+    void getLastIncomingPacketTimeAdvancesOnPacketProcessed() {
+        // Given
+        idleTimer.setIdleTimeout(200);
+        Instant before = idleTimer.getLastIncomingPacketTime();
+
+        // When
+        clock.fastForward(50);
+        idleTimer.packetProcessed();
+
+        // Then
+        assertThat(idleTimer.getLastIncomingPacketTime()).isAfter(before);
+    }
+
+    @Test
+    void getLastIncomingPacketTimeDoesNotAdvanceOnOwnAckElicitingSend() {
+        // Given
+        idleTimer.setIdleTimeout(200);
+        Instant beforeSend = idleTimer.getLastIncomingPacketTime();
+
+        // When (an outgoing ack-eliciting send bumps lastActionTime in the canary fork, but
+        // must NOT bump the peer-receive signal)
+        clock.fastForward(50);
+        idleTimer.packetSent(new ShortHeaderPacket(Version.getDefault(), new byte[0], new PingFrame()), clock.instant());
+
+        // Then
+        assertThat(idleTimer.getLastActionTime()).isAfter(beforeSend);
+        assertThat(idleTimer.getLastIncomingPacketTime()).isEqualTo(beforeSend);
+    }
+
 }
