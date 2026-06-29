@@ -40,6 +40,9 @@ import static tech.kwik.core.common.KwikConstants.MAX_SUPPORTED_PACKET_SIZE;
  */
 public class Receiver {
 
+    /** Minimum gap between consecutive "dropped datagram" warnings, in milliseconds. */
+    private static final long DROP_WARN_WINDOW_MS = 5_000L;
+
     private volatile DatagramSocket socket;
     private final Logger log;
     private final Consumer<Throwable> abortCallback;
@@ -48,6 +51,7 @@ public class Receiver {
     private final BlockingQueue<RawPacket> receivedPacketsQueue;
     private volatile boolean isClosing = false;
     private volatile boolean changing = false;
+    private volatile long lastDropWarnAtMs = 0L;
 
     public Receiver(DatagramSocket socket, Logger log, Consumer<Throwable> abortCallback) {
         this(socket, log, abortCallback, d -> true);
@@ -112,6 +116,13 @@ public class Receiver {
                         RawPacket rawPacket = new RawPacket(receivedPacket, timeReceived, counter++);
                         receivedPacketsQueue.add(rawPacket);
                     }
+                    else {
+                        // Canary fork: upstream drops filter-rejected datagrams silently. In
+                        // practice this hides NAT rebinding and source-address mismatches that
+                        // present as "tunnel established but data stalls". Emit a rate-limited
+                        // warn so the next inflight incident leaves a breadcrumb.
+                        warnDroppedDatagram(receivedPacket);
+                    }
                 }
                 catch (SocketTimeoutException timeout) {
                     // Impossible, as no socket timeout set
@@ -151,5 +162,27 @@ public class Receiver {
         socket = newSocket;
         changing = true;
         oldSocket.close();
+    }
+
+    /**
+     * Emits one warn per {@link #DROP_WARN_WINDOW_MS} window when the packet filter rejects an
+     * inbound datagram. Lossy on purpose: a true source-address attack or persistent NAT rebind
+     * would otherwise spam the log at line rate.
+     */
+    private void warnDroppedDatagram(DatagramPacket packet) {
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastDropWarnAtMs < DROP_WARN_WINDOW_MS) {
+            return;
+        }
+        lastDropWarnAtMs = nowMs;
+        String src;
+        try {
+            src = packet.getAddress() + ":" + packet.getPort();
+        }
+        catch (Throwable t) {
+            src = "n/a";
+        }
+        log.warn("Receiver dropped datagram from " + src
+                + " (filter rejected; peer may have NAT-rebound or unexpected source)");
     }
 }
