@@ -126,6 +126,26 @@ class RetransmitBufferTest {
         assertThat(retransmitBuffer.hasDataToRetransmit()).isFalse();
     }
 
+    @Test
+    void whenMaxFrameSizeBelowHeaderOverheadFrameMustBeRequeuedNotSplitToNegativeLength() {
+        // Defensive guard for sender stack: if the caller squeezes the retransmit into a packet whose remaining space
+        // is below the original frame's header overhead, dataLengthFirstFrame would go negative and constructing the
+        // first StreamFrame would throw NegativeArraySizeException, crashing the sender thread.
+        // Frame layout for offset=7000 (2-byte VLI), length=1212 (2-byte VLI), streamId=0 (1-byte VLI): 1 + 1 + 2 + 2 + 1212 = 1218 bytes.
+        // Header overhead is 6 bytes; ask for a packet budget below overhead.
+        retransmitBuffer.add(new StreamFrame(0, 7000, generateData(1212), true));
+
+        StreamFrame result = retransmitBuffer.getFrameToRetransmit(3);
+
+        // No frame produced, original frame still available for the next retry with larger budget.
+        assertThat(result).isNull();
+        assertThat(retransmitBuffer.hasDataToRetransmit()).isTrue();
+        StreamFrame full = retransmitBuffer.getFrameToRetransmit(1500);
+        assertThat(full).isNotNull();
+        assertThat(full.getOffset()).isEqualTo(7000);
+        assertThat(full.getLength()).isEqualTo(1212);
+    }
+
     private byte[] generateData(int length) {
         byte[] data = new byte[length];
         for (int i = 0; i < length; i++) {

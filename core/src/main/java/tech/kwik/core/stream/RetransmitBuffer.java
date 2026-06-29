@@ -50,6 +50,13 @@ public class RetransmitBuffer {
                 // It's too big, split it in two
                 int excessLength = frame.getFrameLength() - maxFrameSize;
                 int dataLengthFirstFrame = frame.getLength() - excessLength;
+                // Defensive guard: if maxFrameSize is smaller than the original frame's header overhead, dataLengthFirstFrame is negative,
+                // and constructing the first StreamFrame would allocate new byte[negative] inside StreamFrame and crash the sender thread.
+                // Re-queue the frame and signal "nothing fits" so a later iteration with more packet budget can retry.
+                if (dataLengthFirstFrame <= 0) {
+                    data.add(frame);
+                    return null;
+                }
                 StreamFrame first = new StreamFrame(frame.getStreamId(), frame.getOffset(),
                         frame.getStreamData(), 0, dataLengthFirstFrame, false);
                 StreamFrame second = new StreamFrame(frame.getStreamId(), frame.getOffset() + first.getLength(),
