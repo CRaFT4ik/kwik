@@ -102,8 +102,14 @@ public class FlowControl {
     public long increaseFlowControlLimit(QuicStream stream, long requestedLimit) {
         int streamId = stream.getStreamId();
         synchronized (this) {
+            // Stream may have been closed (entries removed by streamClosed) before sender computed the next limit;
+            // treat as no credit available rather than NPE on auto-unbox.
+            Long assigned = maxStreamDataAssigned.get(streamId);
+            if (assigned == null) {
+                return 0;
+            }
             long possibleStreamIncrement = currentStreamCredits(stream);
-            long requestedIncrement = requestedLimit - maxStreamDataAssigned.get(streamId);
+            long requestedIncrement = requestedLimit - assigned;
             long proposedStreamIncrement = Long.min(requestedIncrement, possibleStreamIncrement);
 
             if (requestedIncrement < 0) {
@@ -111,7 +117,7 @@ public class FlowControl {
             }
 
             maxDataAssigned += proposedStreamIncrement;
-            long newStreamLimit = maxStreamDataAssigned.get(streamId) + proposedStreamIncrement;
+            long newStreamLimit = assigned + proposedStreamIncrement;
             maxStreamDataAssigned.put(streamId, newStreamLimit);
 
             return newStreamLimit;
@@ -126,7 +132,11 @@ public class FlowControl {
      */
     public long getFlowControlLimit(QuicStream stream) {
         synchronized (this) {
-            return maxStreamDataAssigned.get(stream.getStreamId()) + currentStreamCredits(stream);
+            Long assigned = maxStreamDataAssigned.get(stream.getStreamId());
+            if (assigned == null) {
+                return 0;
+            }
+            return assigned + currentStreamCredits(stream);
         }
     }
 
@@ -287,8 +297,15 @@ public class FlowControl {
      */
     private long currentStreamCredits(QuicStream stream) {
         int streamId = stream.getStreamId();
-        long allowedByStream = maxStreamDataAllowed.get(streamId);
-        long maxStreamIncrement = allowedByStream - maxStreamDataAssigned.get(streamId);
+        // Callers hold this monitor (the public entry points are synchronized), but the stream's entries
+        // may already be gone if streamClosed ran between the entry point and this call on the same thread
+        // (e.g. via a listener). Treat missing entries as no credit.
+        Long allowedByStream = maxStreamDataAllowed.get(streamId);
+        Long assigned = maxStreamDataAssigned.get(streamId);
+        if (allowedByStream == null || assigned == null) {
+            return 0;
+        }
+        long maxStreamIncrement = allowedByStream - assigned;
         long maxPossibleDataIncrement = maxDataAllowed - maxDataAssigned;
         if (maxStreamIncrement > maxPossibleDataIncrement) {
             maxStreamIncrement = maxPossibleDataIncrement;

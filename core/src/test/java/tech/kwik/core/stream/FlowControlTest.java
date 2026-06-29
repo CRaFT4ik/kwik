@@ -550,4 +550,38 @@ class FlowControlTest {
         assertThat(blockReason).isEqualTo(BlockReason.DATA_BLOCKED);
         assertThat(fc.getConnectionDataLimit()).isEqualTo(100);
     }
+
+    @Test
+    void increaseLimitAfterStreamClosedReturnsZeroAndDoesNotThrow() {
+        // Reproduces the production NPE: streamClosed wipes the map entries before the sender
+        // computes the next limit. The call must degrade to no-credit, not blow up the sender thread.
+        FlowControl fc = new FlowControl(Role.Client, 9999, 9999, 9999, 9999);
+        QuicStreamImpl stream = new QuicStreamImpl(1, role, conn, sm, fc);
+
+        fc.streamClosed(stream);
+
+        assertThat(fc.increaseFlowControlLimit(stream, 100)).isEqualTo(0);
+        assertThat(fc.getFlowControlLimit(stream)).isEqualTo(0);
+    }
+
+    @Test
+    void streamClosedRacingIncreaseFlowControlLimitDoesNotThrow() throws Exception {
+        // Hammer streamClosed against increaseFlowControlLimit across many streams to expose any
+        // remaining unguarded auto-unbox path in the flow controller.
+        FlowControl fc = new FlowControl(Role.Client, Long.MAX_VALUE / 2, Long.MAX_VALUE / 2, Long.MAX_VALUE / 2, Long.MAX_VALUE / 2);
+        int iterations = 1000;
+
+        java.util.List<java.util.concurrent.CompletableFuture<Void>> futures = new java.util.ArrayList<>();
+        for (int i = 0; i < iterations; i++) {
+            int streamId = (i * 4) + 1;  // server-initiated bidi (role here is Client => server-initiated allowed)
+            QuicStreamImpl s = new QuicStreamImpl(streamId, role, conn, sm, fc);
+            fc.streamOpened(s);
+            futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> fc.streamClosed(s)));
+            futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> fc.increaseFlowControlLimit(s, 1024)));
+            futures.add(java.util.concurrent.CompletableFuture.runAsync(() -> fc.getFlowControlLimit(s)));
+        }
+        // join all - if any task threw, allOf will propagate it
+        java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
+                .get(30, java.util.concurrent.TimeUnit.SECONDS);
+    }
 }
