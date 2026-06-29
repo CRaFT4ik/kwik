@@ -1368,6 +1368,39 @@ class QuicStreamImplTest {
         assertThat(retransmittedFrame).isInstanceOf(StreamFrame.class);
         assertThat(((StreamFrame) retransmittedFrame).isFinal()).isTrue();
     }
+
+    @Test
+    void senderCallbackAfterStreamFlowControlStoppedMustNotThrowNegativeArraySize() throws Exception {
+        // Reproduces the production incident "Sender thread aborted with exception: java.lang.NegativeArraySizeException: -<n>".
+        // The race: getFlowControlLimit on the sender thread reads positive credit, then another path calls
+        // flowController.streamClosed (e.g. stopFlowControl on a near-simultaneous finalFrameSent / EarlyDataStream cleanup),
+        // then the sender calls increaseFlowControlLimit. After the close, increaseFlowControlLimit returns 0,
+        // maxAllowedByFlowControl = (0 - currentOffset) is negative, maxBytesToSend underflows,
+        // and SendBuffer.getStreamFrame would do new byte[negative].
+        AtomicBoolean armed = new AtomicBoolean(false);
+        FlowControl realFc = new FlowControl(Role.Client, 9999, 9999, 9999, 9999) {
+            @Override
+            public long increaseFlowControlLimit(tech.kwik.core.QuicStream stream, long requestedLimit) {
+                if (armed.compareAndSet(true, false)) {
+                    streamClosed(stream);  // simulate concurrent close racing with this call
+                }
+                return super.increaseFlowControlLimit(stream, requestedLimit);
+            }
+        };
+        quicStream = new QuicStreamImpl(0, role, connection, streamManager, realFc, logger);
+        // Step 1: send a frame normally to advance currentOffset past zero (production trace was -7829, so currentOffset = 7829).
+        quicStream.getOutputStream().write(new byte[100]);
+        ((StreamOutputStreamImpl) quicStream.getOutputStream()).sendStreamFrame(1200);
+        // Step 2: queue more data so sendBuffer.hasData() is true on the next sendStreamFrame.
+        quicStream.getOutputStream().write(new byte[100]);
+        // Step 3: arm the race. The next increaseFlowControlLimit call will drop the entries (simulating concurrent streamClosed),
+        // making maxAllowedByFlowControl negative.
+        armed.set(true);
+        QuicFrame result = ((StreamOutputStreamImpl) quicStream.getOutputStream()).sendStreamFrame(1200);
+
+        // No exception. The send is skipped (returns null); production sender loop survives.
+        assertThat(result).isNull();
+    }
     //endregion
 
     // region test helper methods

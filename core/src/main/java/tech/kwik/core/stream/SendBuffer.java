@@ -94,6 +94,12 @@ public class SendBuffer {
     }
 
     public StreamFrame getStreamFrame(Version quicVersion, int streamId, long currentOffset, int maxBytesToSend) {
+        // Defensive guard: callers compute maxBytesToSend from packet space minus header overhead minus flow-control credit.
+        // Under race with stream close the credit calculation underflows; allocating a negative-sized byte[] would crash the sender thread.
+        // Returning null leaves the stream in a state where the next legitimate send request can succeed once data is queued.
+        if (maxBytesToSend < 0) {
+            return null;
+        }
         int nrOfBytes = 0;
         byte[] dataToSend = new byte[maxBytesToSend];
         boolean finalFrame = false;

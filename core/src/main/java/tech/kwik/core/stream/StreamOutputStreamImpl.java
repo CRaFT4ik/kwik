@@ -191,6 +191,13 @@ class StreamOutputStreamImpl extends StreamOutputStream implements FlowControlUp
                 int maxAllowedByFlowControl = (int) (flowController.increaseFlowControlLimit(quicStream, currentOffset + maxBytesToSend) - currentOffset);
                 maxBytesToSend = Integer.min(maxAllowedByFlowControl, maxBytesToSend);
 
+                // Stop send if stream flow control was already removed (race: stopFlowControl/streamClosed ran between scheduling and now).
+                // In that case increaseFlowControlLimit returns 0, and (0 - currentOffset) underflows to negative.
+                // Allocating new byte[maxBytesToSend] with negative size in SendBuffer would crash the sender thread.
+                if (maxBytesToSend < 0) {
+                    return null;
+                }
+
                 streamFrame = sendBuffer.getStreamFrame(quicStream.quicVersion, quicStream.streamId, currentOffset, maxBytesToSend);
                 if (streamFrame != null) {
                     currentOffset += streamFrame.getLength();
