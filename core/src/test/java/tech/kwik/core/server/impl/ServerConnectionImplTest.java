@@ -477,6 +477,20 @@ class ServerConnectionImplTest {
         // Then
         assertThat(closeCallbackIsCalled.get()).isTrue();
     }
+
+    @Test
+    void whenServerConnectionIsAbortedConnectionCloseFrameShouldBeSent() throws Exception {
+        // Given
+        byte[] odcid = { 0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08 };
+        connection = createServerConnection(createTlsServerEngine(), true, new byte[8], odcid, cid -> {});
+
+        // When
+        connection.abortConnection(new RuntimeException("injected error"));
+
+        // Then: client must learn the connection is dead instead of silently timing out 48s later.
+        verify(connection.getSender()).send(argThat(frame -> frame instanceof ConnectionCloseFrame
+                && ((ConnectionCloseFrame) frame).getErrorCode() == 0x01 /* INTERNAL_ERROR */), any(EncryptionLevel.class));
+    }
     //endregion
 
     //region anti amplification

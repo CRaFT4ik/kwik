@@ -454,8 +454,12 @@ public class ServerConnectorImpl implements ServerConnector {
     }
 
     private void closed(ServerConnectionImpl connection) {
+        // Idempotent: abortConnection now calls back here both eagerly (safety net) and again from
+        // postTerminateHook after the 3*PTO drain. removeConnection returns null on the second invocation.
         ServerConnectionProxy removedConnection = connectionRegistry.removeConnection(connection);
-        removedConnection.dispose();
+        if (removedConnection != null) {
+            removedConnection.dispose();
+        }
     }
 
     protected void closeAllConnections() {

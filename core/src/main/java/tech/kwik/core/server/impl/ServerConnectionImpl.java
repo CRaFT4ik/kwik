@@ -74,6 +74,7 @@ import java.util.Random;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
+import static tech.kwik.core.QuicConstants.TransportErrorCode.INTERNAL_ERROR;
 import static tech.kwik.core.QuicConstants.TransportErrorCode.INVALID_TOKEN;
 import static tech.kwik.core.QuicConstants.TransportErrorCode.PROTOCOL_VIOLATION;
 import static tech.kwik.core.QuicConstants.TransportErrorCode.TRANSPORT_PARAMETER_ERROR;
@@ -205,6 +206,14 @@ public class ServerConnectionImpl extends QuicConnectionImpl implements ServerCo
     @Override
     public void abortConnection(Throwable error) {
         log.error(this + " aborted due to internal error", error);
+        // Tell the peer that this connection is dying: previously this path was silent, so the client kept
+        // sending into the tunnel until its own idle timeout fired. Emit a CONNECTION_CLOSE with INTERNAL_ERROR
+        // through the standard immediate-close path (which also schedules terminate / postTerminate / closeCallback).
+        // If the sender thread itself is the one that died (e.g. unhandled NPE in sendLoop) the frame may not
+        // make it onto the wire; closeCallback is still invoked here as a safety net so the connection table
+        // gets cleaned up regardless. ServerConnectorImpl.closed() tolerates a double call.
+        immediateCloseWithError(INTERNAL_ERROR.value, "internal error");
+        getSender().flush();
         closeCallback.accept(this);
     }
 
