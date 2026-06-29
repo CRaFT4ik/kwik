@@ -209,11 +209,14 @@ public class ServerConnectionImpl extends QuicConnectionImpl implements ServerCo
         // Tell the peer that this connection is dying: previously this path was silent, so the client kept
         // sending into the tunnel until its own idle timeout fired. Emit a CONNECTION_CLOSE with INTERNAL_ERROR
         // through the standard immediate-close path (which also schedules terminate / postTerminate / closeCallback).
-        // If the sender thread itself is the one that died (e.g. unhandled NPE in sendLoop) the frame may not
-        // make it onto the wire; closeCallback is still invoked here as a safety net so the connection table
-        // gets cleaned up regardless. ServerConnectorImpl.closed() tolerates a double call.
+        // Defense-in-depth: abortConnection is usually invoked from the sender thread's catch block, meaning
+        // the sender thread is dying. A regular flush() only wakes a thread that no longer exists, so the CC
+        // frame would sit in the queue and the peer would wait for its own watchdog. emergencyFlush() drains
+        // the queue inline on this thread, reusing the same encrypt + socket.send pipeline, so the CC actually
+        // hits the wire. closeCallback is still invoked as a safety net so the connection table gets cleaned
+        // up regardless. ServerConnectorImpl.closed() tolerates a double call.
         immediateCloseWithError(INTERNAL_ERROR.value, "internal error");
-        getSender().flush();
+        getSender().emergencyFlush();
         closeCallback.accept(this);
     }
 

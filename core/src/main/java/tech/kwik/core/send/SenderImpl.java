@@ -262,7 +262,30 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
     public void flush() {
         wakeUpSenderLoop();
     }
-    
+
+    /**
+     * Best-effort synchronous drain of the send queues on the calling thread, bypassing the
+     * sender loop entirely.
+     *
+     * Use only when the sender thread is known to be dead (e.g. from the catch block of
+     * {@code sendLoop}, or right after an {@code abortConnection} that was triggered by a
+     * fatal sender error). When the sender thread is alive this is unsafe: the regular
+     * {@link #flush()} should be used instead.
+     *
+     * Reuses the same assemble + encrypt + socket.send pipeline as the loop, so any
+     * frame already queued (notably a CONNECTION_CLOSE just enqueued by
+     * {@code immediateCloseWithError}) actually hits the wire. Failure is swallowed and
+     * logged: we are already on the error path.
+     */
+    public void emergencyFlush() {
+        try {
+            sendIfAny();
+        }
+        catch (Throwable t) {
+            log.warn("emergencyFlush failed: " + t);
+        }
+    }
+
     public void changeAddress(DatagramSocket newSocket) {
         socket = newSocket;
     }
