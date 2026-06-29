@@ -18,6 +18,7 @@
  */
 package tech.kwik.core.impl;
 
+import tech.kwik.core.Statistics;
 import tech.kwik.core.concurrent.DaemonThreadFactory;
 import tech.kwik.core.log.Logger;
 import tech.kwik.core.packet.QuicPacket;
@@ -109,7 +110,26 @@ public class IdleTimer {
                 // to be at least three times the current Probe Timeout (PTO)
                 if (lastActionTime.plusMillis(3L * currentPto).isBefore(now)) {
                     timer.shutdown();
-                    connection.silentlyCloseConnection(timeout + currentPto);
+                    // Canary fork: upstream calls silentlyCloseConnection here, which terminates the
+                    // connection without emitting a CONNECTION_CLOSE frame. The peer then has to wait
+                    // out its own idle timer before it learns the tunnel is gone. Emit an explicit
+                    // application-level CC instead so the peer's ConnectionTerminatedEvent fires
+                    // immediately with byPeer=true, and log enough state to diagnose why.
+                    long ageMs = now.toEpochMilli() - lastActionTime.toEpochMilli();
+                    String statsSummary;
+                    try {
+                        Statistics stats = connection.getStats();
+                        statsSummary = String.format(
+                                "latestRttMs=%d packetsSent=%d lostPackets=%d",
+                                stats.latestRtt(), stats.packetsSent(), stats.lostPackets());
+                    }
+                    catch (Throwable t) {
+                        statsSummary = "stats=n/a";
+                    }
+                    log.warn(String.format(
+                            "idle-timer expired: lastAction=%s ageMs=%d timeoutMs=%d ptoMs=%d %s - closing with CC",
+                            lastAction, ageMs, timeout, currentPto, statsSummary));
+                    connection.close(0L, "idle-timer-watchdog");
                 }
             }}
     }

@@ -63,10 +63,10 @@ class IdleTimerTest {
         idleTimer.packetProcessed();
 
         clock.fastForward(150);
-        verify(connection, never()).silentlyCloseConnection(anyInt());
+        verify(connection, never()).close(anyLong(), anyString());
 
         clock.fastForward(51);
-        verify(connection, times(1)).silentlyCloseConnection(anyLong());
+        verify(connection, times(1)).close(anyLong(), anyString());
     }
 
     @Test
@@ -77,10 +77,10 @@ class IdleTimerTest {
         idleTimer.packetSent(new ShortHeaderPacket(Version.getDefault(), new byte[0], new PingFrame()), clock.instant());
 
         clock.fastForward(150);
-        verify(connection, never()).silentlyCloseConnection(anyLong());
+        verify(connection, never()).close(anyLong(), anyString());
 
         clock.fastForward(51);
-        verify(connection, times(1)).silentlyCloseConnection(anyLong());
+        verify(connection, times(1)).close(anyLong(), anyString());
     }
 
     @Test
@@ -89,10 +89,10 @@ class IdleTimerTest {
         idleTimer.setPtoSupplier(() -> 100);
 
         clock.fastForward(201);
-        verify(connection, never()).silentlyCloseConnection(anyLong());
+        verify(connection, never()).close(anyLong(), anyString());
 
         clock.fastForward(100);
-        verify(connection, times(1)).silentlyCloseConnection(anyLong());
+        verify(connection, times(1)).close(anyLong(), anyString());
     }
 
     @Test
@@ -120,7 +120,11 @@ class IdleTimerTest {
     }
 
     @Test
-    void whenSendingAckElicitingItShouldNotResetTimerWhenNotTheFirst() {
+    void consecutiveAckElicitingSendsShouldKeepRestartingTheTimer() {
+        // Canary fork: upstream rule "only restart on send when previous action was a receive"
+        // is dropped, so back-to-back PINGs over a lossy path keep pushing the deadline forward.
+        // See IdleTimer.packetSent for the rationale.
+
         // Given
         idleTimer.setIdleTimeout(200);
         clock.fastForward(150);
@@ -131,8 +135,12 @@ class IdleTimerTest {
         idleTimer.packetSent(new ShortHeaderPacket(Version.getDefault(), new byte[0], new PingFrame()), clock.instant());
         clock.fastForward(150);
 
-        // Then
-        verify(connection).silentlyCloseConnection(anyLong());
+        // Then - second send reset the timer, so 150ms after it is still within the 200ms window.
+        verify(connection, never()).close(anyLong(), anyString());
+
+        // And once we wait past the new deadline, the timer fires.
+        clock.fastForward(51);
+        verify(connection, times(1)).close(anyLong(), anyString());
     }
 
 
