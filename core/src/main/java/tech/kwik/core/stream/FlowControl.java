@@ -148,17 +148,22 @@ public class FlowControl {
      */
     public BlockReason getFlowControlBlockReason(QuicStream stream) {
         int streamId = stream.getStreamId();
-        if (! maxStreamDataAllowed.containsKey(streamId)) {
+        synchronized (this) {
+            // Read both entries under the monitor: streamClosed removes them together, so either both are present or both are absent.
+            // Without the monitor, containsKey could see allowed but a concurrent streamClosed could drop assigned before .get(streamId).longValue(), NPE-ing the sender thread.
+            Long allowed = maxStreamDataAllowed.get(streamId);
+            Long assigned = maxStreamDataAssigned.get(streamId);
+            if (allowed == null || assigned == null) {
+                return BlockReason.NOT_BLOCKED;
+            }
+            if (assigned.longValue() == allowed.longValue()) {
+                return BlockReason.STREAM_DATA_BLOCKED;
+            }
+            if (maxDataAllowed == maxDataAssigned) {
+                return BlockReason.DATA_BLOCKED;
+            }
             return BlockReason.NOT_BLOCKED;
         }
-        if (maxStreamDataAssigned.get(streamId).equals(maxStreamDataAllowed.get(streamId))) {
-            return BlockReason.STREAM_DATA_BLOCKED;
-        }
-        if (maxDataAllowed == maxDataAssigned) {
-            return BlockReason.DATA_BLOCKED;
-        }
-
-        return BlockReason.NOT_BLOCKED;
     }
 
     /**

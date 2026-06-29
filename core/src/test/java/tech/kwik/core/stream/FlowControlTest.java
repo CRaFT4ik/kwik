@@ -260,6 +260,20 @@ class FlowControlTest {
     }
 
     @Test
+    void getFlowControlBlockReasonForClosedStreamReturnsNotBlockedAndDoesNotThrow() {
+        // Defensive guard for the sendBlockReason path. Without the fix, a containsKey-then-get sequence is non-atomic
+        // and a concurrent streamClosed between the two could NPE on .equals(null) and crash the sender thread.
+        FlowControl fc = new FlowControl(Role.Client, 1000, 1000, 1000, 1000);
+        QuicStream stream = new QuicStreamImpl(1, role, conn, sm, fc);
+        fc.streamOpened(stream);
+        fc.increaseFlowControlLimit(stream, 500);
+        fc.streamClosed(stream);
+
+        // entries removed -> NOT_BLOCKED, no exception
+        assertThat(fc.getFlowControlBlockReason(stream)).isEqualTo(BlockReason.NOT_BLOCKED);
+    }
+
+    @Test
     void maxStreamDataFrameForClosedStreamIsIgnored() throws Exception {
         // Given
         FlowControl fc = new FlowControl(Role.Client, 100, 100, 100, 100);
