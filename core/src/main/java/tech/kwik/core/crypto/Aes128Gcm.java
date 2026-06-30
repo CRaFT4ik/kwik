@@ -47,13 +47,15 @@ public class Aes128Gcm extends BaseAeadImpl {
 
     @Override
     protected Cipher getHeaderProtectionCipher() {
-        if (hpCipher == null) {
+        Cipher c = hpCipher.get();
+        if (c == null) {
             try {
                 // https://tools.ietf.org/html/draft-ietf-quic-tls-27#section-5.4.3
                 // "AEAD_AES_128_GCM and AEAD_AES_128_CCM use 128-bit AES [AES] in electronic code-book (ECB) mode."
-                hpCipher = Cipher.getInstance("AES/ECB/NoPadding");
-                SecretKeySpec keySpec = new SecretKeySpec(getHp(), "AES");
-                hpCipher.init(Cipher.ENCRYPT_MODE, keySpec);
+                c = Cipher.getInstance("AES/ECB/NoPadding");
+                SecretKeySpec hpKeySpec = new SecretKeySpec(getHp(), "AES");
+                c.init(Cipher.ENCRYPT_MODE, hpKeySpec);
+                hpCipher.set(c);
             }
             catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
                 // Inappropriate runtime environment
@@ -64,15 +66,15 @@ public class Aes128Gcm extends BaseAeadImpl {
                 throw new RuntimeException();
             }
         }
-        return hpCipher;
+        return c;
     }
 
     @Override
     public byte[] createHeaderProtectionMask(byte[] sample) {
-        Cipher hpCipher = getHeaderProtectionCipher();
+        Cipher hp = getHeaderProtectionCipher();
         byte[] mask;
         try {
-            mask = hpCipher.doFinal(sample);
+            mask = hp.doFinal(sample);
         }
         catch (IllegalBlockSizeException | BadPaddingException e) {
             // Programming error
@@ -83,27 +85,32 @@ public class Aes128Gcm extends BaseAeadImpl {
 
     @Override
     protected SecretKeySpec getKeySpec() {
-        if (keySpec == null) {
-            keySpec = new SecretKeySpec(key, "AES");
+        SecretKeySpec ks = keySpec;
+        if (ks == null) {
+            // SecretKeySpec is immutable, so a benign race producing two equal instances is safe.
+            ks = new SecretKeySpec(key, "AES");
+            keySpec = ks;
         }
-        return keySpec;
+        return ks;
     }
 
     @Override
     protected Cipher getCipher() {
-        if (cipher == null) {
+        Cipher c = cipher.get();
+        if (c == null) {
             try {
                 // From https://tools.ietf.org/html/draft-ietf-quic-tls-16#section-5.3:
                 // "Prior to establishing a shared secret, packets are protected with AEAD_AES_128_GCM"
                 String AES_GCM_NOPADDING = "AES/GCM/NoPadding";
-                cipher = Cipher.getInstance(AES_GCM_NOPADDING);
+                c = Cipher.getInstance(AES_GCM_NOPADDING);
+                cipher.set(c);
             }
             catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
                 // Inappropriate runtime environment
                 throw new QuicRuntimeException(e);
             }
         }
-        return cipher;
+        return c;
     }
 
     @Override

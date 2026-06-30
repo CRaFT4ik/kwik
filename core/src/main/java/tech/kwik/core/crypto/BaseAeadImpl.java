@@ -56,9 +56,13 @@ public abstract class BaseAeadImpl implements Aead {
     protected byte[] key;
     protected byte[] iv;
     protected byte[] hp;
-    protected Cipher hpCipher;
-    protected SecretKeySpec keySpec;
-    protected Cipher cipher;
+    // ThreadLocal so concurrent encrypt/decrypt threads each own their javax.crypto.Cipher
+    // instance (Cipher is stateful and NOT thread-safe). Subclasses lazy-init per-thread in
+    // getCipher() / getHeaderProtectionCipher(). On key rotation the whole Aead is replaced
+    // by KeyUpdateSupport, so stale ThreadLocals die with the old instance.
+    protected final ThreadLocal<Cipher> hpCipher = new ThreadLocal<>();
+    protected volatile SecretKeySpec keySpec;
+    protected final ThreadLocal<Cipher> cipher = new ThreadLocal<>();
 
     public BaseAeadImpl(Version quicVersion, Role nodeRole, boolean initial, byte[] secret, byte[] hp, Logger log) {
         this.nodeRole = nodeRole;
@@ -130,6 +134,10 @@ public abstract class BaseAeadImpl implements Aead {
 
         // https://tools.ietf.org/html/rfc8446#section-7.3
         key = hkdfExpandLabel(quicVersion, encryptionLevelSecret, labelPrefix + "key", "", getKeyLength());
+        // Forget the cached SecretKeySpec so the next getKeySpec() rebuilds it from the new key.
+        // Concurrent encrypt callers see either the old or the new SecretKeySpec and re-init their
+        // ThreadLocal Cipher with whichever they read; that is harmless because KeyUpdateSupport
+        // replaces the whole Aead on key rotation, so this path is only the lazy-init reset.
         keySpec = null;
         log.secret(nodeRole + " key", key);
 

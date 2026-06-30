@@ -69,9 +69,11 @@ public class ChaCha20 extends BaseAeadImpl {
 
     @Override
     protected Cipher getHeaderProtectionCipher() {
-        if (hpCipher == null) {
+        Cipher c = hpCipher.get();
+        if (c == null) {
             try {
-                hpCipher = Cipher.getInstance("ChaCha20");
+                c = Cipher.getInstance("ChaCha20");
+                hpCipher.set(c);
             } catch (NoSuchAlgorithmException e) {
                 // Inappropriate runtime environment
                 throw new QuicRuntimeException(e);
@@ -80,29 +82,34 @@ public class ChaCha20 extends BaseAeadImpl {
                 throw new RuntimeException();
             }
         }
-        return hpCipher;
+        return c;
     }
 
     @Override
     protected SecretKeySpec getKeySpec() {
-        if (keySpec == null) {
-            keySpec = new SecretKeySpec(key, "ChaCha20-Poly1305");
+        SecretKeySpec ks = keySpec;
+        if (ks == null) {
+            // SecretKeySpec is immutable, so a benign race producing two equal instances is safe.
+            ks = new SecretKeySpec(key, "ChaCha20-Poly1305");
+            keySpec = ks;
         }
-        return keySpec;
+        return ks;
     }
 
     @Override
     protected Cipher getCipher() {
-        if (cipher == null) {
+        Cipher c = cipher.get();
+        if (c == null) {
             try {
-                cipher = Cipher.getInstance("ChaCha20-Poly1305");
+                c = Cipher.getInstance("ChaCha20-Poly1305");
+                cipher.set(c);
             }
             catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
                 // Inappropriate runtime environment
                 throw new QuicRuntimeException(e);
             }
         }
-        return cipher;
+        return c;
     }
 
     @Override
