@@ -27,7 +27,7 @@ import java.util.function.Consumer;
  */
 public class SendItem {
 
-    protected final static Consumer<QuicPacket> EMPTY_CALLBACK = p -> {};
+    static final Consumer<QuicPacket> EMPTY_CALLBACK = p -> {};
 
     private final QuicPacket packet;
     private final Consumer<QuicPacket> packetLostCallback;

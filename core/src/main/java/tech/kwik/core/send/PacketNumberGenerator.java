@@ -18,16 +18,30 @@
  */
 package tech.kwik.core.send;
 
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * Monotonic packet number source for a single QUIC packet-number space.
+ *
+ * Thread-safe: {@link #nextPacketNumber()} is backed by an {@link AtomicLong} and may
+ * be called from any thread. Numbers handed out are strictly increasing, with no
+ * gaps when callers consume each number they request.
+ *
+ * Multi-thread pipeline mode allocates packet numbers from the dispatcher thread only
+ * after a packet is known to be non-empty, so there is never a need to "give back"
+ * a previously allocated number; the legacy single-thread restore API has been removed
+ * to make this invariant explicit.
+ */
 public class PacketNumberGenerator {
 
-    private long packetNumber;
+    private final AtomicLong packetNumber = new AtomicLong();
 
+    /**
+     * Allocates the next packet number for this PN space.
+     *
+     * @return the next monotonic packet number, starting at 0 on a fresh generator
+     */
     public long nextPacketNumber() {
-        return packetNumber++;
-    }
-
-    public void restorePacketNumber() {
-        packetNumber--;
+        return packetNumber.getAndIncrement();
     }
 }
-

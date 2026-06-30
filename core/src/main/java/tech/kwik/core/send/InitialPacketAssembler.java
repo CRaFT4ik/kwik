@@ -58,10 +58,19 @@ public class InitialPacketAssembler extends PacketAssembler {
     }
 
     @Override
+    Optional<PreEncryptionPacket> prepareUnencrypted(int remainingCwndSize, int availablePacketSize, byte[] sourceConnectionId, byte[] destinationConnectionId) {
+        if (availablePacketSize < 1200) {
+            // Same minimum-1200-byte rule as in assemble(): an Initial packet that wouldn't fit
+            // the mandatory padding budget is dropped rather than allocated a PN.
+            return Optional.empty();
+        }
+        return super.prepareUnencrypted(remainingCwndSize, availablePacketSize, sourceConnectionId, destinationConnectionId);
+    }
+
+    @Override
     protected QuicPacket createPacket(byte[] sourceConnectionId, byte[] destinationConnectionId) {
-        InitialPacket packet = new InitialPacket(quicVersion.getVersion(), sourceConnectionId, destinationConnectionId, initialToken, (QuicFrame) null);
-        packet.setPacketNumber(nextPacketNumber());
-        return packet;
+        // Don't assign a PN here; see PacketAssembler.createPacket for the contract.
+        return new InitialPacket(quicVersion.getVersion(), sourceConnectionId, destinationConnectionId, initialToken, (QuicFrame) null);
     }
 
     public void setInitialToken(byte[] initialToken) {

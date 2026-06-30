@@ -39,6 +39,11 @@ import static tech.kwik.core.common.EncryptionLevel.App;
 /**
  * Assembles QUIC packets for a given encryption level, based on "send requests" that are previously queued.
  * These send requests either contain a frame, or can produce a frame to be sent.
+ *
+ * Allocates a packet number only after the assembled packet is known to be non-empty, so
+ * the underlying {@link PacketNumberGenerator} never has to roll back. This contract is what
+ * lets the upcoming multi-thread sender pipeline drive assembly from a dispatcher and
+ * encryption from a worker pool without racing on the PN counter.
  */
 public class PacketAssembler {
 
@@ -67,21 +72,59 @@ public class PacketAssembler {
     }
 
     /**
-     * Assembles a QUIC packet for the encryption level handled by this instance.
-     * @param remainingCwndSize
-     * @param availablePacketSize
-     * @param sourceConnectionId        can be null when encryption level is 1-rtt; but not for the other levels; can be empty array though
-     * @param destinationConnectionId
-     * @return
+     * Assembles a QUIC packet for the encryption level handled by this instance and assigns a
+     * packet number to it.
+     *
+     * Thin compatibility wrapper around {@link #prepareUnencrypted}: on a non-empty result it
+     * allocates a fresh PN via {@link PacketNumberGenerator#nextPacketNumber()}, stamps it onto
+     * the packet, and registers any included ACK frame with the {@link AckGenerator}. Used by
+     * the single-thread sender path (legacy mode, {@code encryption-pool-size=0}); the pipeline
+     * dispatcher calls {@link #prepareUnencrypted} directly so it can sequence PN allocation
+     * against the encryption queue.
+     *
+     * @param remainingCwndSize         soft upper bound on packet size from the congestion controller
+     * @param availablePacketSize       hard upper bound on packet size from datagram/MTU budget
+     * @param sourceConnectionId        may be null at App level, must be non-null at other levels (empty array allowed)
+     * @param destinationConnectionId   peer connection id to address the packet to
+     * @return assembled packet with PN assigned, or empty if no frames fit
      */
     Optional<SendItem> assemble(int remainingCwndSize, int availablePacketSize, byte[] sourceConnectionId, byte[] destinationConnectionId) {
+        Optional<PreEncryptionPacket> prepared = prepareUnencrypted(remainingCwndSize, availablePacketSize, sourceConnectionId, destinationConnectionId);
+        if (prepared.isEmpty()) {
+            return Optional.empty();
+        }
+        PreEncryptionPacket pre = prepared.get();
+        long pn = packetNumberGenerator.nextPacketNumber();
+        pre.assignPacketNumber(pn, ackGenerator);
+        return Optional.of(new SendItem(pre.getPacket(), pre.getPacketLostCallback()));
+    }
+
+    /**
+     * Assembles a packet body (frames + optional ACK) for this encryption level without
+     * allocating or stamping a packet number.
+     *
+     * Pulls send requests, the explicit ACK, and probe data exactly as {@link #assemble} does,
+     * but stops short of touching {@link PacketNumberGenerator}. The returned
+     * {@link PreEncryptionPacket} carries a callback that the caller must invoke once a PN has
+     * been allocated; that callback stamps the PN onto the packet and registers any embedded
+     * ACK with the {@link AckGenerator}. This split lets the pipeline dispatcher allocate PN
+     * only after assembly is known to have produced frames, so allocations are always consumed.
+     *
+     * @param remainingCwndSize         soft upper bound on packet size from the congestion controller
+     * @param availablePacketSize       hard upper bound on packet size from datagram/MTU budget
+     * @param sourceConnectionId        may be null at App level, must be non-null at other levels (empty array allowed)
+     * @param destinationConnectionId   peer connection id to address the packet to
+     * @return a non-empty unencrypted packet awaiting PN, or empty when no frames fit
+     */
+    Optional<PreEncryptionPacket> prepareUnencrypted(int remainingCwndSize, int availablePacketSize, byte[] sourceConnectionId, byte[] destinationConnectionId) {
         final int available = Integer.min(remainingCwndSize, availablePacketSize);
 
         QuicPacket packet = createPacket(sourceConnectionId, destinationConnectionId);
         List<Consumer<QuicFrame>> callbacks = new ArrayList<>();
 
         AckFrame ackFrame = null;
-        // Check for an explicit ack, i.e. an ack on ack-eliciting packet that cannot be delayed (any longer)
+        // Check for an explicit ack, i.e. an ack on ack-eliciting packet that cannot be delayed (any longer).
+        // ACK frame is recorded here but registered with AckGenerator only after PN is allocated (see PreEncryptionPacket.assignPacketNumber).
         if (requestQueue.mustAndWillSendAck()) {
             if (ackGenerator.hasNewAckToSend()) {
                 ackFrame = ackGenerator.generateAck().get();   // Explicit ack cannot disappear by other means than sending it.
@@ -91,7 +134,6 @@ public class PacketAssembler {
                 if (packet.estimateLength(ackFrame.getFrameLength()) <= availablePacketSize) {
                     packet.addFrame(ackFrame);
                     callbacks.add(EMPTY_CALLBACK);
-                    ackGenerator.registerAckSendWithPacket(ackFrame, packet.getPacketNumber());
                 }
                 else {
                     // If not even a mandatory ack can be added, don't bother about other frames: theoretically there might be frames
@@ -118,7 +160,7 @@ public class PacketAssembler {
             }
             packet.setIsProbe(true);
             packet.addFrames(probeData);
-            return Optional.of(new SendItem(packet));
+            return Optional.of(new PreEncryptionPacket(packet, ackFrame, SendItem.EMPTY_CALLBACK));
         }
 
         if (requestQueue.hasRequests()) {
@@ -161,14 +203,13 @@ public class PacketAssembler {
                 callbacks.add(EMPTY_CALLBACK);
             }
         }
-        Optional<SendItem> assembledItem;
+        Optional<PreEncryptionPacket> prepared;
         if (packet.getFrames().isEmpty()) {
-            // Nothing could be added, discard packet and mark packet number as not used
-            restorePacketNumber();
-            assembledItem = Optional.empty();
+            // Nothing fit; do not allocate a PN so the counter stays gap-free for the dispatcher.
+            prepared = Optional.empty();
         }
         else {
-            assembledItem = Optional.of(new SendItem(packet, createPacketLostCallback(packet, callbacks)));
+            prepared = Optional.of(new PreEncryptionPacket(packet, ackFrame, createPacketLostCallback(packet, callbacks)));
         }
 
         if (stopping && requestQueue.isEmpty(false)) {
@@ -177,15 +218,11 @@ public class PacketAssembler {
             }
         }
 
-        return assembledItem;
+        return prepared;
     }
 
     protected long nextPacketNumber() {
         return packetNumberGenerator.nextPacketNumber();
-    }
-
-    protected void restorePacketNumber() {
-        packetNumberGenerator.restorePacketNumber();
     }
 
     private Consumer<QuicPacket> createPacketLostCallback(QuicPacket packet, List<Consumer<QuicFrame>> callbacks) {
@@ -217,7 +254,11 @@ public class PacketAssembler {
             default:
                 throw new RuntimeException();  // programming error
         }
-        packet.setPacketNumber(nextPacketNumber());
+        // Provisional PN=0 only for estimateLength sizing during assembly; the real PN is stamped
+        // by PreEncryptionPacket.assignPacketNumber once the packet is known non-empty. Using 0
+        // (1-byte encoded) keeps assembly sizing consistent with the legacy behaviour where PN
+        // was assigned eagerly from the start of the connection.
+        packet.setPacketNumber(0);
         return packet;
     }
 
