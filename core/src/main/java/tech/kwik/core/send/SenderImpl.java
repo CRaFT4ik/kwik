@@ -40,6 +40,8 @@ import tech.kwik.core.packet.ShortHeaderPacket;
 import tech.kwik.core.recovery.RecoveryManager;
 import tech.kwik.core.recovery.RttEstimator;
 
+import static tech.kwik.core.common.EncryptionLevel.App;
+
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -119,6 +121,14 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
     private volatile Instant lastestAckElicitingTime;
     private final byte[] paddingPattern;
 
+    // Multi-sender pipeline (stage-7). Active when encryptionPoolSize > 0; otherwise SenderImpl
+    // runs the legacy single-thread sendLoop path unchanged. Pipeline mode applies only to
+    // App-level single-packet datagrams; handshake/coalesced datagrams stay on the inline path
+    // so coalescing semantics are preserved (Initial+Handshake amplification rule).
+    private final int encryptionPoolSize;
+    private final EncryptionWorkerPool encryptionPool;
+    private final SenderEmitter emitter;
+
 
     public SenderImpl(VersionHolder version, int maxPacketSize, DatagramSocket socket, InetSocketAddress peerAddress,
                       QuicConnectionImpl connection, String id, Integer initialRtt, Logger log) {
@@ -168,10 +178,48 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
         else {
             paddingPattern = new byte[]{ 0 };
         }
+
+        encryptionPoolSize = resolveEncryptionPoolSize();
+        if (encryptionPoolSize > 0) {
+            String emitterName = "sender-emit" + (!id.isBlank() ? "-" + id : "");
+            emitter = new SenderEmitter(emitterName, this::emitEncryptedFromPipeline, log);
+            encryptionPool = new EncryptionWorkerPool(encryptionPoolSize, 256,
+                    "kwik-encrypt" + (!id.isBlank() ? "-" + id : ""),
+                    emitter::submit, log);
+            log.info("Sender pipeline enabled: encryption pool size=" + encryptionPoolSize);
+        }
+        else {
+            emitter = null;
+            encryptionPool = null;
+        }
+    }
+
+    /**
+     * Resolves the encryption pool size from a system-property opt-in.
+     * Pool size 0 (the default) keeps the legacy single-thread sender pipeline; tests
+     * and existing deployments see no behavioural change. Pipeline mode must be enabled
+     * explicitly by setting {@code tech.kwik.core.send.encryption-pool-size} to a positive
+     * integer.
+     */
+    private static int resolveEncryptionPoolSize() {
+        String override = System.getProperty("tech.kwik.core.send.encryption-pool-size");
+        if (override == null || override.isBlank()) return 0;
+        try {
+            int v = Integer.parseInt(override.trim());
+            return Math.max(0, v);
+        }
+        catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     public void start(ConnectionSecrets secrets) {
         connectionSecrets = secrets;
+        if (emitter != null) {
+            // Order matters: emitter must be ready before the dispatcher (senderThread) starts
+            // pushing PendingEncryption into the pool, whose output sink is emitter.submit.
+            emitter.start();
+        }
         senderThread.start();
     }
 
@@ -341,6 +389,14 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
         shutdownHook = postShutdownAction;
         stopping = true;
         senderThread.interrupt();
+        // Tear down pipeline workers after the dispatcher loop has been signalled; the worker pool
+        // grace period covers in-flight encryptions and the emitter waits for them before draining.
+        if (encryptionPool != null) {
+            encryptionPool.shutdown();
+        }
+        if (emitter != null) {
+            emitter.shutdown(2000);
+        }
     }
 
     @Override
@@ -459,6 +515,15 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
 
     void send(AssembledDatagram assembledDatagram) throws IOException {
         List<SendItem> itemsToSend = assembledDatagram.getItems();
+        // Pipeline path: a clean single-packet App-level datagram with no external padding
+        // can be encrypted off-thread by the worker pool and emitted from the dedicated emitter
+        // thread. Anything else (coalesced Initial/Handshake, padding) keeps the legacy
+        // inline path so coalescing and amplification rules stay exactly as before.
+        if (canSendViaPipeline(assembledDatagram)) {
+            sendViaPipeline(itemsToSend.get(0));
+            return;
+        }
+
         byte[] datagramData = new byte[maxPacketSize];
         ByteBuffer buffer = ByteBuffer.wrap(datagramData);
         try {
@@ -515,6 +580,78 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
         log.sent(timeSent, packetsSent);
         dataSent += countDataBytes(packetsSent);
         qlog.emitPacketSentEvent(packetsSent, timeSent);
+    }
+
+    private boolean canSendViaPipeline(AssembledDatagram datagram) {
+        if (encryptionPool == null) return false;
+        List<SendItem> items = datagram.getItems();
+        if (items.size() != 1) return false;
+        if (datagram.getMinDatagramSize() > 0) return false;
+        QuicPacket packet = items.get(0).getPacket();
+        return packet.getEncryptionLevel() == App;
+    }
+
+    /**
+     * Dispatch path used when {@link #canSendViaPipeline} is true: hands the packet to the
+     * encryption worker pool. The emitter eventually calls back into
+     * {@link #emitEncryptedFromPipeline} on its own thread to actually put bytes on the wire
+     * and run recovery / idle / qlog bookkeeping.
+     */
+    private void sendViaPipeline(SendItem item) {
+        QuicPacket packet = item.getPacket();
+        Aead aead;
+        try {
+            aead = connectionSecrets.getOwnAead(packet.getEncryptionLevel());
+        }
+        catch (MissingKeysException e) {
+            if (e.getMissingKeysCause() == MissingKeysException.Cause.DiscardedKeys) {
+                log.warn("Packet not sent because keys are discarded: " + packet);
+                return;
+            }
+            throw new IllegalStateException(e.getMessage());
+        }
+        PendingEncryption pending = new PendingEncryption(packet, packet.getPacketNumber(),
+                packet.getEncryptionLevel(), aead, item.getPacketLostCallback());
+        try {
+            encryptionPool.enqueue(pending);
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Emitter-thread callback that puts a single-packet App-level datagram on the wire
+     * and runs the same recovery / idle / qlog bookkeeping the legacy
+     * {@link #send(AssembledDatagram)} path runs after socket.send. Single-threaded by
+     * design (emitter runs only one such callback at a time), so timestamps are monotonic.
+     */
+    private void emitEncryptedFromPipeline(EncryptedPacket encrypted) {
+        if (encrypted.isSkipped()) {
+            return;
+        }
+        try {
+            byte[] data = encrypted.getDatagramBytes();
+            DatagramPacket datagram = new DatagramPacket(data, data.length, peerAddress.getAddress(), peerAddress.getPort());
+            Instant timeSent = clock.instant();
+            socket.send(datagram);
+            datagramsSent++;
+            packetsSent += 1;
+            bytesSent += data.length;
+            QuicPacket packet = encrypted.getPacket();
+            recoveryManager.packetSent(packet, timeSent, encrypted.getPacketLostCallback());
+            idleTimer.packetSent(packet, timeSent);
+            if (packet.isAckEliciting()) {
+                lastestAckElicitingTime = timeSent;
+            }
+            log.raw("packet sent, pn: " + packet.getPacketNumber(), data);
+            log.sent(timeSent, List.of(packet));
+            dataSent += countDataBytes(List.of(packet));
+            qlog.emitPacketSentEvent(List.of(packet), timeSent);
+        }
+        catch (IOException ioe) {
+            log.error("Emitter socket.send failed for pn=" + encrypted.getPacketNumber(), ioe);
+        }
     }
 
     private void addExternalPadding(ByteBuffer buffer, int minDatagramSize) {
