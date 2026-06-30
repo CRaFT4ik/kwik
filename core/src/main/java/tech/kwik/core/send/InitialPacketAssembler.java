@@ -69,8 +69,9 @@ public class InitialPacketAssembler extends PacketAssembler {
 
     @Override
     protected QuicPacket createPacket(byte[] sourceConnectionId, byte[] destinationConnectionId) {
-        // Don't assign a PN here; see PacketAssembler.createPacket for the contract.
-        return new InitialPacket(quicVersion.getVersion(), sourceConnectionId, destinationConnectionId, initialToken, (QuicFrame) null);
+        InitialPacket packet = new InitialPacket(quicVersion.getVersion(), sourceConnectionId, destinationConnectionId, initialToken, (QuicFrame) null);
+        packet.setPacketNumber(nextPacketNumber());
+        return packet;
     }
 
     public void setInitialToken(byte[] initialToken) {

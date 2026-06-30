@@ -72,21 +72,19 @@ public class PacketAssembler {
     }
 
     /**
-     * Assembles a QUIC packet for the encryption level handled by this instance and assigns a
-     * packet number to it.
+     * Assembles a QUIC packet for the encryption level handled by this instance.
      *
-     * Thin compatibility wrapper around {@link #prepareUnencrypted}: on a non-empty result it
-     * allocates a fresh PN via {@link PacketNumberGenerator#nextPacketNumber()}, stamps it onto
-     * the packet, and registers any included ACK frame with the {@link AckGenerator}. Used by
-     * the single-thread sender path (legacy mode, {@code encryption-pool-size=0}); the pipeline
-     * dispatcher calls {@link #prepareUnencrypted} directly so it can sequence PN allocation
-     * against the encryption queue.
+     * Thin compatibility wrapper around {@link #prepareUnencrypted}: finalises the prepared
+     * packet (registers any embedded ACK frame with the {@link AckGenerator}) and returns
+     * the {@link SendItem}. The packet's PN is already stamped by
+     * {@link #createPacket}; an empty result leaves a wire-level gap in PN numbering,
+     * which QUIC tolerates.
      *
      * @param remainingCwndSize         soft upper bound on packet size from the congestion controller
      * @param availablePacketSize       hard upper bound on packet size from datagram/MTU budget
      * @param sourceConnectionId        may be null at App level, must be non-null at other levels (empty array allowed)
      * @param destinationConnectionId   peer connection id to address the packet to
-     * @return assembled packet with PN assigned, or empty if no frames fit
+     * @return assembled packet ready for emission, or empty if no frames fit
      */
     Optional<SendItem> assemble(int remainingCwndSize, int availablePacketSize, byte[] sourceConnectionId, byte[] destinationConnectionId) {
         Optional<PreEncryptionPacket> prepared = prepareUnencrypted(remainingCwndSize, availablePacketSize, sourceConnectionId, destinationConnectionId);
@@ -94,8 +92,7 @@ public class PacketAssembler {
             return Optional.empty();
         }
         PreEncryptionPacket pre = prepared.get();
-        long pn = packetNumberGenerator.nextPacketNumber();
-        pre.assignPacketNumber(pn, ackGenerator);
+        pre.finalizeForSend(ackGenerator);
         return Optional.of(new SendItem(pre.getPacket(), pre.getPacketLostCallback()));
     }
 
@@ -254,11 +251,11 @@ public class PacketAssembler {
             default:
                 throw new RuntimeException();  // programming error
         }
-        // Provisional PN=0 only for estimateLength sizing during assembly; the real PN is stamped
-        // by PreEncryptionPacket.assignPacketNumber once the packet is known non-empty. Using 0
-        // (1-byte encoded) keeps assembly sizing consistent with the legacy behaviour where PN
-        // was assigned eagerly from the start of the connection.
-        packet.setPacketNumber(0);
+        // Consume a PN up front so estimateLength sees the actual encoded PN width (1..4 bytes)
+        // for accurate sizing. Once allocated, the PN is owned by this packet whether assembly
+        // ends up producing frames or not: an empty assemble leaves a wire-level gap, which
+        // QUIC tolerates (RFC 9002 explicitly allows gaps in PN ranges).
+        packet.setPacketNumber(nextPacketNumber());
         return packet;
     }
 

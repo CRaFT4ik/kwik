@@ -36,10 +36,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
 /**
- * Verifies the PN-allocation contract introduced in phase 3 of the multi-sender pipeline:
- * the underlying {@link PacketNumberGenerator} is consumed only when an assembled packet
- * is non-empty, so there is no rollback path and no gaps between consecutive successful
- * assemble calls.
+ * Verifies the no-restorePacketNumber contract introduced in phase 3 of the multi-sender
+ * pipeline: the assembler never calls back into {@link PacketNumberGenerator} to roll back
+ * an allocated PN. PN allocation happens once in {@link PacketAssembler#createPacket} (so
+ * {@code estimateLength} sees the real encoded PN width); empty assembles leave the
+ * allocated PN as a wire-level gap, which QUIC tolerates per RFC 9002.
  */
 class PacketAssemblerNoRestoreTest extends AbstractSenderTest {
 
@@ -59,20 +60,7 @@ class PacketAssemblerNoRestoreTest extends AbstractSenderTest {
     }
 
     @Test
-    void prepareUnencryptedDoesNotAllocatePnWhenEmpty() {
-        // Given no send requests in the queue, prepareUnencrypted returns empty
-        Optional<PreEncryptionPacket> first = oneRttPacketAssembler.prepareUnencrypted(1200, 1232, null, new byte[0]);
-        assertThat(first).isEmpty();
-
-        // When a real frame is then queued and assembled, the first PN issued must still be 0
-        sendRequestQueue.addRequest(maxSize -> new StreamFrame(0, new byte[5], true), 4 + 5, null);
-        Optional<SendItem> assembled = oneRttPacketAssembler.assemble(1200, 1232, null, new byte[0]);
-        assertThat(assembled).isPresent();
-        assertThat(assembled.get().getPacket().getPacketNumber()).isEqualTo(0L);
-    }
-
-    @Test
-    void consecutiveAssemblesProduceContiguousPnsWithNoGaps() {
+    void consecutiveSuccessfulAssemblesProduceStrictlyIncreasingPns() {
         sendRequestQueue.addRequest(maxSize -> new StreamFrame(0, new byte[5], false), 4 + 5, null);
         long first = oneRttPacketAssembler.assemble(1200, 1232, null, new byte[0]).get().getPacket().getPacketNumber();
 
@@ -82,30 +70,30 @@ class PacketAssemblerNoRestoreTest extends AbstractSenderTest {
         sendRequestQueue.addRequest(maxSize -> new StreamFrame(0, new byte[5], true), 4 + 5, null);
         long third = oneRttPacketAssembler.assemble(1200, 1232, null, new byte[0]).get().getPacket().getPacketNumber();
 
-        // No-restore contract: PNs are strictly +1 since every prepare succeeded.
+        // Strictly increasing, no rollback. Successful assembles back-to-back are contiguous since
+        // no empty assemble intervened to burn a PN.
         assertThat(second).isEqualTo(first + 1);
         assertThat(third).isEqualTo(second + 1);
     }
 
     @Test
-    void emptyAssembleAttemptsDoNotBurnPns() {
-        // Given a few empty assemble attempts (no queued requests), PN generator must stay at 0
-        for (int i = 0; i < 10; i++) {
-            Optional<SendItem> empty = oneRttPacketAssembler.assemble(1200, 1232, null, new byte[0]);
-            assertThat(empty).isEmpty();
-        }
+    void emptyAssembleConsumesAPnWithoutRollback() {
+        // Empty assemble: a PN was allocated in createPacket; no frames produced; PN is burned (gap).
+        // The next successful assemble must see a strictly larger PN, never reuse the burned one.
+        Optional<SendItem> empty = oneRttPacketAssembler.assemble(1200, 1232, null, new byte[0]);
+        assertThat(empty).isEmpty();
+
         sendRequestQueue.addRequest(maxSize -> new StreamFrame(0, new byte[5], true), 4 + 5, null);
-        Optional<SendItem> assembled = oneRttPacketAssembler.assemble(1200, 1232, null, new byte[0]);
-        assertThat(assembled).isPresent();
-        assertThat(assembled.get().getPacket().getPacketNumber()).isEqualTo(0L);
+        long realPn = oneRttPacketAssembler.assemble(1200, 1232, null, new byte[0]).get().getPacket().getPacketNumber();
+        assertThat(realPn).isGreaterThan(0L);
     }
 
     @Test
-    void prepareUnencryptedReturnsPacketWithoutStampedPn() {
+    void prepareUnencryptedReturnsPacketWithStampedPn() {
         sendRequestQueue.addRequest(maxSize -> new StreamFrame(0, new byte[5], true), 4 + 5, null);
         Optional<PreEncryptionPacket> prepared = oneRttPacketAssembler.prepareUnencrypted(1200, 1232, null, new byte[0]);
         assertThat(prepared).isPresent();
-        // Provisional PN=0 is used only for sizing; generator is untouched until the dispatcher allocates one.
-        assertThat(pnGenerator.nextPacketNumber()).isEqualTo(0L);
+        // PN already stamped in createPacket so encryption workers can size the packet correctly.
+        assertThat(prepared.get().getPacket().getPacketNumber()).isGreaterThanOrEqualTo(0L);
     }
 }

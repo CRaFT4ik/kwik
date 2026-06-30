@@ -25,17 +25,19 @@ import tech.kwik.core.packet.QuicPacket;
 import java.util.function.Consumer;
 
 /**
- * A QUIC packet body assembled by {@link PacketAssembler#prepareUnencrypted} but not yet
- * assigned a packet number.
+ * A QUIC packet body assembled by {@link PacketAssembler#prepareUnencrypted}, with its
+ * packet number already stamped (consumed from the {@link PacketNumberGenerator} inside
+ * {@code createPacket}) but ACK-frame registration with the {@link AckGenerator} still
+ * pending.
  *
- * Returned from {@code prepareUnencrypted} only when the packet is non-empty (frames fit
- * within the available size), so a PN can be safely allocated for it without ever needing
- * to roll back the generator. The pipeline dispatcher allocates the PN and calls
- * {@link #assignPacketNumber}; that stamps the PN onto the packet and, if the packet
- * carries an explicit ACK frame, registers the send with the {@link AckGenerator}.
+ * Deferring ACK registration to {@link #finalizeForSend} keeps the side effect on the
+ * assembler/dispatcher thread (the thread that produced the PN), so the ACK is registered
+ * exactly once per packet and in PN-allocation order. Empty assembles never produce a
+ * PreEncryptionPacket, so a non-empty packet always backs every consumed PN; an empty
+ * assemble simply leaves a wire-level gap, which QUIC tolerates.
  *
- * Single-use: once {@link #assignPacketNumber} has been called the underlying packet is
- * ready for encryption and emission; do not reuse the instance.
+ * Single-use: once {@link #finalizeForSend} has been called the underlying packet is ready
+ * for encryption and emission; do not reuse the instance.
  */
 public class PreEncryptionPacket {
 
@@ -44,8 +46,8 @@ public class PreEncryptionPacket {
     private final Consumer<QuicPacket> packetLostCallback;
 
     /**
-     * @param packet              the assembled but PN-less packet
-     * @param ackFrame            the explicit ACK frame included in the packet, or null if none; ACK registration is deferred until PN is known
+     * @param packet              the assembled packet; PN already stamped via {@code packet.setPacketNumber} in {@link PacketAssembler#createPacket}
+     * @param ackFrame            the explicit ACK frame included in the packet, or null if none; ACK registration is deferred until {@link #finalizeForSend}
      * @param packetLostCallback  callback to invoke from the recovery manager if the eventual send is detected lost
      */
     public PreEncryptionPacket(QuicPacket packet, AckFrame ackFrame, Consumer<QuicPacket> packetLostCallback) {
@@ -58,25 +60,23 @@ public class PreEncryptionPacket {
     }
 
     /**
-     * Stamps the allocated packet number onto the underlying packet and finalises ACK
-     * bookkeeping if this packet carries an explicit ACK frame.
+     * Finalises this packet for downstream encryption + emission: if it carries an explicit
+     * ACK frame, registers the send with the supplied {@link AckGenerator}; otherwise a no-op.
      *
-     * Must be called exactly once per instance, by the thread that owns PN allocation
+     * Must be called exactly once per instance, on the same thread that produced the packet
      * (legacy sender thread, or the pipeline dispatcher). After this returns, the packet
      * is ready to be encrypted and emitted.
      *
-     * @param packetNumber  PN allocated for this packet from {@link PacketNumberGenerator}
-     * @param ackGenerator  the ACK generator to register the send with; may be a no-op if {@code ackFrame} is null
+     * @param ackGenerator  the ACK generator to register the send with; ignored if {@code ackFrame} is null
      */
-    public void assignPacketNumber(long packetNumber, AckGenerator ackGenerator) {
-        packet.setPacketNumber(packetNumber);
+    public void finalizeForSend(AckGenerator ackGenerator) {
         if (ackFrame != null) {
-            ackGenerator.registerAckSendWithPacket(ackFrame, packetNumber);
+            ackGenerator.registerAckSendWithPacket(ackFrame, packet.getPacketNumber());
         }
     }
 
     /**
-     * @return the underlying QUIC packet; PN is unset until {@link #assignPacketNumber} is called
+     * @return the underlying QUIC packet with its PN already stamped
      */
     public QuicPacket getPacket() {
         return packet;
