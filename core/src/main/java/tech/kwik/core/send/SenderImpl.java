@@ -183,10 +183,18 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
         if (encryptionPoolSize > 0) {
             String emitterName = "sender-emit" + (!id.isBlank() ? "-" + id : "");
             emitter = new SenderEmitter(emitterName, this::emitEncryptedFromPipeline, log);
-            encryptionPool = new EncryptionWorkerPool(encryptionPoolSize, 256,
+            // Pool queue capacity sized to keep buffered-backlog latency under control.
+            // Cap = poolSize * 8 packets, so at ~20us encryption per packet the worst-case
+            // head-of-line wait for a newly-arriving urgent packet (e.g. an ACK on a fresh
+            // probe stream) stays well under 1 ms. A larger queue would let bulk producers
+            // backlog tens of milliseconds of buffered packets ahead of a probe and is what
+            // showed up as tail-latency regression in the pipeline-vs-legacy benchmark.
+            int queueCapacity = Math.max(16, encryptionPoolSize * 8);
+            encryptionPool = new EncryptionWorkerPool(encryptionPoolSize, queueCapacity,
                     "kwik-encrypt" + (!id.isBlank() ? "-" + id : ""),
                     emitter::submit, log);
-            log.info("Sender pipeline enabled: encryption pool size=" + encryptionPoolSize);
+            log.info("Sender pipeline enabled: encryption pool size=" + encryptionPoolSize
+                    + ", queue capacity=" + queueCapacity);
         }
         else {
             emitter = null;
@@ -612,6 +620,11 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
         }
         PendingEncryption pending = new PendingEncryption(packet, packet.getPacketNumber(),
                 packet.getEncryptionLevel(), aead, item.getPacketLostCallback());
+        // Announce the PN to the emitter BEFORE enqueueing: workers may finish very fast, so by
+        // the time the encrypted packet hits the emitter's priority queue the dispatcher must
+        // already have published the PN as in-flight, otherwise the emitter cannot tell a
+        // legitimate worker reorder gap from a wire-level burnt-PN gap.
+        emitter.announceSubmitted(packet.getPacketNumber());
         try {
             encryptionPool.enqueue(pending);
         }

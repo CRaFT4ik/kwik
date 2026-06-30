@@ -20,8 +20,11 @@ package tech.kwik.core.send;
 
 import tech.kwik.core.log.Logger;
 
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * Dedicated single thread that drains encrypted packets from the {@link EncryptionWorkerPool}
@@ -64,6 +67,14 @@ public class SenderEmitter {
     }
 
     private final PriorityBlockingQueue<EncryptedPacket> queue;
+    /**
+     * Tracks PNs that the dispatcher has submitted to the encryption pool but the emitter has
+     * not yet emitted. Used to distinguish wire-level PN gaps (PNs the dispatcher burned, e.g.
+     * via an empty assemble that consumed the shared App+ZeroRTT PN generator) from genuine
+     * worker reordering (a worker still encrypting a PN below the emitter head). Bounded by
+     * encryption pool capacity + reorder window, so size stays small.
+     */
+    private final ConcurrentSkipListSet<Long> inflightPns = new ConcurrentSkipListSet<>();
     private final EmissionSink sink;
     private final Logger log;
     private final Thread thread;
@@ -98,6 +109,22 @@ public class SenderEmitter {
      */
     public void submit(EncryptedPacket packet) {
         queue.offer(packet);
+    }
+
+    /**
+     * Dispatcher hook: announce that a PN has been handed to the encryption pool and a
+     * corresponding {@link EncryptedPacket} (or "skipped" placeholder on worker failure)
+     * will eventually arrive via {@link #submit}.
+     *
+     * Called from the dispatcher (single-thread) BEFORE {@code encryptionPool.enqueue}, so the
+     * emitter can tell legitimate worker-reorder gaps (PNs that ARE in flight) from wire-level
+     * gaps (PNs the dispatcher allocated but never submitted, e.g. assembled-empty results that
+     * still burnt a PN via the shared App+ZeroRTT generator). Without this signal the emitter
+     * would pay a reorder-wait per burnt PN; on Windows that wait is ~1-3 ms per gap because
+     * the JVM timer rounds sub-millisecond sleeps up, which collapses throughput by 50x.
+     */
+    public void announceSubmitted(long packetNumber) {
+        inflightPns.add(packetNumber);
     }
 
     /**
@@ -141,30 +168,44 @@ public class SenderEmitter {
                     }
                 }
                 else if (head.getPacketNumber() > expectedNextPN) {
-                    // Out-of-order: head is ahead of expected; wait briefly for the missing
-                    // PN (a slower worker) to arrive, otherwise advance past the gap.
-                    long deadline = System.nanoTime() + REORDER_TIMEOUT_NANOS;
-                    long remainingNanos;
-                    while ((remainingNanos = deadline - System.nanoTime()) > 0) {
-                        EncryptedPacket peek = queue.peek();
-                        if (peek != null && peek.getPacketNumber() <= expectedNextPN) {
-                            // Missing PN arrived via concurrent submit; next loop iteration picks it up.
-                            break;
-                        }
-                        // Sleep briefly waiting for a new submission. Use a short sleep so we re-check head soon.
-                        long sleepNanos = Math.min(remainingNanos, 10_000L);
-                        TimeUnit.NANOSECONDS.sleep(sleepNanos);
-                    }
-                    // Re-peek after the wait; queue may have a new min now.
-                    head = queue.peek();
-                    if (head == null) {
-                        continue;
-                    }
-                    if (head.getPacketNumber() > expectedNextPN) {
-                        // Timed out waiting; advance expectedNextPN past the gap and emit current head.
+                    // Head is ahead of expected. Two reasons this happens:
+                    //   1) Wire-level PN gap: dispatcher allocated PNs in (expectedNextPN, head.pn)
+                    //      but never submitted them (assemble returned empty after stamping the PN,
+                    //      common when App + ZeroRTT share a PN generator). These PNs will never
+                    //      arrive; advance immediately.
+                    //   2) Worker reorder: a worker is still encrypting some PN < head.pn and will
+                    //      submit it shortly. Wait briefly so we emit in order.
+                    // Distinguishing case 1 from case 2 with no waste of time: consult inflightPns,
+                    // the dispatcher's announce-on-submit set. If no in-flight PN is < head.pn,
+                    // the gap is wire-level (case 1) and we skip ahead with zero sleep.
+                    Long lowestInflight = inflightPns.isEmpty() ? null : inflightPns.first();
+                    if (lowestInflight == null || lowestInflight >= head.getPacketNumber()) {
+                        // No worker is producing anything below head.pn; gap is pure wire-level.
                         expectedNextPN = head.getPacketNumber();
                     }
-                    // Fall through; head.PN now == expectedNextPN.
+                    else {
+                        // Worker reorder: wait briefly for the in-flight low PN to arrive.
+                        long deadline = System.nanoTime() + REORDER_TIMEOUT_NANOS;
+                        long remainingNanos;
+                        while ((remainingNanos = deadline - System.nanoTime()) > 0) {
+                            EncryptedPacket peek = queue.peek();
+                            if (peek != null && peek.getPacketNumber() <= expectedNextPN) {
+                                // Late worker arrived; restart loop, fall into the else branch.
+                                break;
+                            }
+                            long sleepNanos = Math.min(remainingNanos, 10_000L);
+                            TimeUnit.NANOSECONDS.sleep(sleepNanos);
+                        }
+                        head = queue.peek();
+                        if (head == null) {
+                            continue;
+                        }
+                        if (head.getPacketNumber() > expectedNextPN) {
+                            // Timed out: worker presumably crashed (skipped marker should have arrived
+                            // but didn't). Advance past the gap and emit current head.
+                            expectedNextPN = head.getPacketNumber();
+                        }
+                    }
                     head = queue.poll();
                     if (head == null) {
                         continue;
@@ -177,9 +218,21 @@ public class SenderEmitter {
                     }
                 }
 
-                // At this point: head.PN == expectedNextPN (either originally, or after timeout-skip).
+                // At this point: head.PN == expectedNextPN (either originally, or after skip).
                 emit(head);
-                expectedNextPN = head.getPacketNumber() + 1;
+                // Math.max guards against a late-arriving worker whose PN is below the current
+                // expectedNextPN (which we may have already advanced past via the wire-level gap
+                // branch): emit the late packet (it's wire-tolerable reorder) but never let
+                // expectedNextPN regress, otherwise the next gap check would see a fake gap.
+                expectedNextPN = Math.max(expectedNextPN, head.getPacketNumber() + 1);
+                inflightPns.remove(head.getPacketNumber());
+                // Trim any inflightPns entries below the new expectedNextPN that were never
+                // emitted (e.g. dispatcher announced but the corresponding packet was discarded
+                // by the worker on a fatal error and the skip marker raced ahead): keeps the set
+                // bounded so lowestInflight stays accurate.
+                while (!inflightPns.isEmpty() && inflightPns.first() < expectedNextPN) {
+                    inflightPns.pollFirst();
+                }
             }
             catch (InterruptedException e) {
                 if (!running) {
