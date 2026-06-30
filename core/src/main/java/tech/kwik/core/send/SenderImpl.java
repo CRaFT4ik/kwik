@@ -106,6 +106,7 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
     private volatile boolean running;
     private volatile boolean stopping;
     private volatile boolean stopped;
+    private volatile boolean senderDead;
     private volatile int receiverMaxAckDelay;
     private volatile int datagramsSent;
     private volatile long bytesSent;
@@ -267,10 +268,10 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
      * Best-effort synchronous drain of the send queues on the calling thread, bypassing the
      * sender loop entirely.
      *
-     * Use only when the sender thread is known to be dead (e.g. from the catch block of
-     * {@code sendLoop}, or right after an {@code abortConnection} that was triggered by a
-     * fatal sender error). When the sender thread is alive this is unsafe: the regular
-     * {@link #flush()} should be used instead.
+     * Called only when the sender thread is known dead (set via {@link #senderDead}); a live
+     * sender thread runs {@link #assemblePacket()} on its own thread, so a concurrent caller
+     * here would race packet assembly and the socket. {@link #ServerConnectionImpl#abortConnection}
+     * chooses between this path and the regular {@link #flush()} based on {@link #isSenderDead()}.
      *
      * Reuses the same assemble + encrypt + socket.send pipeline as the loop, so any
      * frame already queued (notably a CONNECTION_CLOSE just enqueued by
@@ -278,12 +279,30 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
      * logged: we are already on the error path.
      */
     public void emergencyFlush() {
+        if (!senderDead) {
+            // Guard rail: caller decides via isSenderDead(); skip if misused while sender alive.
+            log.warn("emergencyFlush invoked while sender thread is still alive; skipping to avoid race");
+            return;
+        }
         try {
             sendIfAny();
         }
         catch (Throwable t) {
             log.warn("emergencyFlush failed: " + t);
         }
+    }
+
+    /**
+     * Returns true when the sender thread is known to no longer be running its loop.
+     *
+     * Set to true from {@link #sendLoop} just before it exits with a fatal exception, and from
+     * {@link #shutdown} after the sender thread has been interrupted and joined to completion.
+     * Callers on the error path use this to decide whether to drive
+     * {@link #emergencyFlush()} inline (dead sender) or signal the live sender via
+     * {@link #flush()}.
+     */
+    public boolean isSenderDead() {
+        return senderDead;
     }
 
     public void changeAddress(DatagramSocket newSocket) {
@@ -341,6 +360,9 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
             }
         }
         catch (Throwable fatalError) {
+            // Mark dead before abortConnection so the receiver-thread caller of abortConnection
+            // takes the emergencyFlush path instead of racing the now-dying sender thread.
+            senderDead = true;
             if (running) {
                 log.error("Sender thread aborted with exception", fatalError);
                 connection.abortConnection(fatalError);
@@ -349,6 +371,9 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
                 log.warn("Ignoring " + fatalError + " because sender is shutting down.");
             }
         }
+        // Either the loop returned normally (running == false via stopping) or it threw above.
+        // In both cases the sender thread is on its way out, so no further loop iterations.
+        senderDead = true;
         if (shutdownHook != null) {
             shutdownHook.run();
         }

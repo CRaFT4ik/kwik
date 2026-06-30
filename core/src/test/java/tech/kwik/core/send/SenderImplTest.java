@@ -217,6 +217,60 @@ class SenderImplTest extends AbstractSenderTest {
     }
 
     @Test
+    void emergencyFlushIsNoOpWhenSenderThreadIsAlive() throws Exception {
+        // Given: stub packet assembler so any assemble call would produce a sendable datagram.
+        setupMockPacketAssember();
+
+        // When: caller misuses emergencyFlush while senderDead == false (sender thread still alive).
+        sender.emergencyFlush();
+
+        // Then: guard rail must short-circuit; no socket write and no assemble work happens.
+        verify(packetAssembler, never()).assemble(anyInt(), anyInt(), any(byte[].class), any(byte[].class));
+        verify(socket, never()).send(any(DatagramPacket.class));
+    }
+
+    @Test
+    void emergencyFlushDrainsQueueWhenSenderDead() throws Exception {
+        // Given: simulate sender thread having died, then queue a frame the dying sender never drained.
+        FieldSetter.setField(sender, sender.getClass().getDeclaredField("senderDead"), true);
+        sender.enableAllLevels();
+        sender.send(new PingFrame(), EncryptionLevel.App);
+
+        // When
+        sender.emergencyFlush();
+
+        // Then: drains inline on the calling thread; the queued frame actually hits the wire.
+        verify(socket).send(any(DatagramPacket.class));
+    }
+
+    @Test
+    void isSenderDeadFlipsToTrueWhenSenderLoopCatchesFatalError() throws Exception {
+        // Given: install an assembler that throws on assemble, so sendLoop hits its fatal-error catch.
+        packetAssembler = mock(GlobalPacketAssembler.class);
+        when(packetAssembler.assemble(anyInt(), anyInt(), any(byte[].class), any(byte[].class)))
+                .thenThrow(new RuntimeException("simulated fatal"));
+        when(packetAssembler.nextDelayedSendTime()).thenReturn(Optional.empty());
+        FieldSetter.setField(sender, sender.getClass().getDeclaredField("packetAssembler"), packetAssembler);
+
+        QuicConnectionImpl connection = (QuicConnectionImpl) new FieldReader(sender, sender.getClass().getDeclaredField("connection")).read();
+
+        assertThat(sender.isSenderDead()).isFalse();
+
+        // When: start the sender thread and queue something so it actually runs assemblePacket and throws.
+        sender.start(connectionSecrets);
+        sender.send(new PingFrame(), EncryptionLevel.App);
+        sender.flush();
+
+        // Then: the catch block in sendLoop flips senderDead and notifies the connection.
+        long deadline = System.currentTimeMillis() + 2000;
+        while (!sender.isSenderDead() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(sender.isSenderDead()).isTrue();
+        verify(connection, timeout(1000)).abortConnection(any(Throwable.class));
+    }
+
+    @Test
     void whenInitialKeysAreDiscardedSendShouldNotThrowButJustIgnoreThePacket() throws Exception {
         // Given
         when(connectionSecrets.getOwnAead(EncryptionLevel.Initial)).thenThrow(new MissingKeysException(EncryptionLevel.Initial, true));

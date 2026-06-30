@@ -209,14 +209,20 @@ public class ServerConnectionImpl extends QuicConnectionImpl implements ServerCo
         // Tell the peer that this connection is dying: previously this path was silent, so the client kept
         // sending into the tunnel until its own idle timeout fired. Emit a CONNECTION_CLOSE with INTERNAL_ERROR
         // through the standard immediate-close path (which also schedules terminate / postTerminate / closeCallback).
-        // Defense-in-depth: abortConnection is usually invoked from the sender thread's catch block, meaning
-        // the sender thread is dying. A regular flush() only wakes a thread that no longer exists, so the CC
-        // frame would sit in the queue and the peer would wait for its own watchdog. emergencyFlush() drains
-        // the queue inline on this thread, reusing the same encrypt + socket.send pipeline, so the CC actually
-        // hits the wire. closeCallback is still invoked as a safety net so the connection table gets cleaned
-        // up regardless. ServerConnectorImpl.closed() tolerates a double call.
+        // Two callers of abortConnection: the sender thread's catch block (sender dying, must drain inline) and
+        // ServerConnectionThread's catch-all (sender still alive, must let it drain). emergencyFlush() on a live
+        // sender races assemblePacket() and the socket on this thread, producing duplicate CC frames or partial
+        // datagrams. Gate on senderDead: if dead, drain inline; if alive, signal it via flush() and let the
+        // sender thread emit the CC frame as part of its normal cycle. closeCallback is still invoked as a safety
+        // net so the connection table gets cleaned up regardless. ServerConnectorImpl.closed() tolerates double calls.
         immediateCloseWithError(INTERNAL_ERROR.value, "internal error");
-        getSender().emergencyFlush();
+        SenderImpl s = getSender();
+        if (s.isSenderDead()) {
+            s.emergencyFlush();
+        }
+        else {
+            s.flush();
+        }
         closeCallback.accept(this);
     }
 
