@@ -222,6 +222,30 @@ public class PacketAssembler {
         return packetNumberGenerator.nextPacketNumber();
     }
 
+    /**
+     * Returns true when {@link #prepareUnencrypted} would (almost certainly) produce a non-empty
+     * packet given the current state of the send-request queue, the ack generator, and any
+     * outstanding probe. Cheap, side-effect-free, intended for the pipeline dispatcher to short-circuit
+     * empty-assemble calls that would otherwise burn a packet number on a shared PN generator
+     * (App + ZeroRTT share one) and bloat the wire-level PN gap, which the multi-thread emitter
+     * pays for as a reorder wait.
+     *
+     * "Almost certainly" because there is one rare false-positive: an ACK or single frame may
+     * still fail to fit when {@code availablePacketSize} or {@code remainingCwndSize} is tiny.
+     * False positives only cost a wasted PN on that one iteration, which is the legacy behaviour;
+     * false negatives would lose a real send and are not acceptable, so the check is permissive.
+     */
+    boolean hasAnythingToSend() {
+        if (requestQueue.hasRequests()) return true;
+        if (requestQueue.hasProbe()) return true;
+        if (requestQueue.mustSendAck() && ackGenerator.hasNewAckToSend()) return true;
+        // PING-to-elicit-ack edge case lives only in the App assembler; safe to include here without
+        // false negatives at other levels, as wantsAckFromPeer is also gated on having sent
+        // ack-only-only packets recently.
+        if (level == App && ackGenerator.wantsAckFromPeer()) return true;
+        return false;
+    }
+
     private Consumer<QuicPacket> createPacketLostCallback(QuicPacket packet, List<Consumer<QuicFrame>> callbacks) {
         if (packet.getFrames().size() != callbacks.size()) {
             throw new IllegalStateException();

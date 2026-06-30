@@ -102,6 +102,13 @@ public class GlobalPacketAssembler {
         for (EncryptionLevel level: enabledLevels) {
             PacketAssembler assembler = this.packetAssembler[level.ordinal()];
             if (assembler != null) {
+                // Short-circuit: skip the assemble call (and its PN burn from createPacket) if
+                // there is provably nothing to send at this level. Critical for App-space PN
+                // contiguity in pipeline mode: App and ZeroRTT share one PN generator, so a
+                // pointless ZeroRTT.assemble() burns an App-space PN every iteration, which the
+                // SenderEmitter then has to skip over with a reorder-wait. Legacy single-thread
+                // sender tolerated the gaps; the pipeline does not.
+                if (!assembler.hasAnythingToSend()) continue;
                 Optional<SendItem> item = assembler.assemble(remaining, maxDatagramSize - size, sourceConnectionId, destinationConnectionId);
                 if (item.isPresent()) {
                     packets.add(item.get());
