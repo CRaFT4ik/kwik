@@ -835,6 +835,76 @@ class QuicClientConnectionImplTest {
     }
 
     @Test
+    void senderAbortDuringHandshakeShouldCompleteConnectPromptly() throws Exception {
+        // Regression guard: connect() is `synchronized` on the connection and awaits
+        // handshakeFinishedCondition inside that monitor. If abortConnection also synchronizes on
+        // `this`, a sender-thread abort during the handshake blocks on the connect() monitor and
+        // the latch countDown fires only after connect() times out. The abortLock refactor is
+        // the fix; this test proves the latch counts down within a small budget rather than
+        // hiding behind the (default 5 s) connectTimeout.
+        //
+        // We build a fresh connection with a very small connectTimeout so that a regression is
+        // detectable even under CI jitter: the assert budget (500 ms) sits below the timeout
+        // (1500 ms) with comfortable margin, and the fast-path finishes in single-digit ms.
+        QuicClientConnectionImpl handshakingConn = (QuicClientConnectionImpl) QuicClientConnectionImpl.newBuilder()
+                .connectTimeout(Duration.ofMillis(1500))
+                .connectionIdLength(4)
+                .uri(new URI("//localhost:443"))
+                .applicationProtocol("hq-interop")
+                .logger(logger).build();
+        FieldSetter.setField(handshakingConn, "parser", mock(ClientRolePacketParser.class));
+        SenderImpl fakeSender = Mockito.mock(SenderImpl.class);
+        var idManager = new FieldReader(handshakingConn, handshakingConn.getClass().getDeclaredField("connectionIdManager")).read();
+        FieldSetter.setField(idManager, "sender", fakeSender);
+        FieldSetter.setField(handshakingConn, "sender", fakeSender);
+        FieldSetter.setField(handshakingConn, QuicConnectionImpl.class, "callbackThread", new TestScheduledExecutor(new TestClock()));
+        // Drive the connection into the state connect()'s latch-wait sees: state=Handshaking,
+        // secrets present so no NPE fires on the state-transition path. We do NOT actually invoke
+        // connect() (that would try to bind a receiver socket and drive real crypto); instead we
+        // await the latch directly on a background thread to simulate connect()'s wait phase.
+        FieldSetter.setField(handshakingConn, QuicConnectionImpl.class, "connectionState", QuicConnectionImpl.Status.Handshaking);
+        java.util.concurrent.CountDownLatch waiterEntered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicLong latchReturnedNs = new java.util.concurrent.atomic.AtomicLong(-1L);
+        // Emulate connect()'s `synchronized (this)` + latch.await pattern: hold the connection
+        // monitor while waiting on handshakeFinishedCondition. This is the exact shape that used
+        // to deadlock a sender-thread abortConnection contending on the same monitor.
+        Thread waiter = new Thread(() -> {
+            synchronized (handshakingConn) {
+                waiterEntered.countDown();
+                try {
+                    var latchField = handshakingConn.getClass().getDeclaredField("handshakeFinishedCondition");
+                    latchField.setAccessible(true);
+                    java.util.concurrent.CountDownLatch latch = (java.util.concurrent.CountDownLatch) latchField.get(handshakingConn);
+                    latch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                    latchReturnedNs.set(System.nanoTime());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }, "handshake-waiter");
+        waiter.start();
+        assertThat(waiterEntered.await(1, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        // When: sender-thread abort fires while connect() is parked in the latch.await inside
+        // the connection monitor. With the abortLock fix this must complete promptly; before the
+        // fix, abortConnection would block on `this` until the latch's own 5 s wait elapsed.
+        long abortStartNs = System.nanoTime();
+        handshakingConn.abortConnection(new IOException("Network is unreachable"));
+
+        waiter.join(2_000);
+        long waiterElapsedMs = (latchReturnedNs.get() - abortStartNs) / 1_000_000;
+
+        // Then: latch counted down within a small budget of the abort call, proving the state
+        // transition and countDown() did not serialize on the connect() monitor.
+        assertThat(waiter.isAlive()).isFalse();
+        assertThat(latchReturnedNs.get()).isNotEqualTo(-1L);
+        assertThat(waiterElapsedMs)
+                .as("Sender-abort during handshake must count the latch down promptly; a slow " +
+                        "path here means abortConnection is contending with connect()'s monitor.")
+                .isLessThan(500L);
+    }
+
+    @Test
     void concurrentAbortConnectionCallsShouldEmitOnlyOneEvent() throws Exception {
         // Given: two threads race abortConnection - sender loop + receiver loop can both catch a fatal
         // error and both call abortConnection. Without synchronized guard both callers can pass the

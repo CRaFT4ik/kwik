@@ -145,6 +145,14 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
     private final ClientConnectionConfig connectionProperties;
     private volatile byte[] token;
     private final CountDownLatch handshakeFinishedCondition = new CountDownLatch(1);
+    // Dedicated lock for the abortConnection state-transition guard. Using `this` here would
+    // serialize with connect(), which is `synchronized` on the connection and blocks inside
+    // handshakeFinishedCondition.await(...). CountDownLatch.await does not release the object
+    // monitor, so a sender-thread abortConnection contending on `this` would wait for the full
+    // connectTimeout instead of counting the latch down promptly. A separate lock lets the
+    // state transition finish immediately; countDown() and the rest of the teardown then run
+    // outside any lock, freeing connect()'s waiter regardless of monitor state.
+    private final Object abortLock = new Object();
     private volatile TransportParameters peerTransportParams;
     private KeepAliveActor keepAliveActor;
     private String applicationProtocol;
@@ -1057,9 +1065,11 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
         // terminal or closing/draining state has been entered so a duplicate listener callback and a second
         // sender.stop()/terminate() round are impossible. abortConnection is called from at least two threads
         // (sender loop and receiver loop), and connectionState is only volatile, so the read+write must be
-        // guarded by this monitor - without synchronization both callers can pass the guard concurrently and
-        // race the follow-up teardown.
-        synchronized (this) {
+        // guarded by a lock - without synchronization both callers can pass the guard concurrently and race
+        // the follow-up teardown. Uses a dedicated abortLock instead of `this` so that connect() (which is
+        // `synchronized` on the connection and awaits handshakeFinishedCondition inside that monitor) cannot
+        // block a sender-thread abort. See the abortLock declaration for the full rationale.
+        synchronized (abortLock) {
             if (connectionState.closingOrDraining()) {
                 return;
             }
@@ -1072,6 +1082,9 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
         if (error != null) {
             log.error("Aborting connection because of error", error);
         }
+        // countDown OUTSIDE abortLock and OUTSIDE `this` so connect()'s waiter can proceed even while
+        // holding the connection monitor. The state transition above under abortLock is the single
+        // linearization point; everything below is idempotent side-effect cleanup.
         handshakeFinishedCondition.countDown();
         sender.stop();
         terminate();
