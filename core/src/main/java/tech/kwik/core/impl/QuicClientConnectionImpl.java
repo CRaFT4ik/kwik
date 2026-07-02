@@ -1053,16 +1053,21 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
      */
     @Override
     public void abortConnection(Throwable error) {
-        // Idempotency guard: if the connection is already in a terminal state a previous abort/close path has already
-        // emitted the terminate event (or is about to). Skipping here avoids a duplicate listener callback and a
-        // second sender.stop()/terminate() round.
-        if (connectionState == Status.Error || connectionState == Status.Closed) {
-            return;
+        // Idempotency guard, symmetric with silentlyCloseConnection and immediateCloseWithError: skip when any
+        // terminal or closing/draining state has been entered so a duplicate listener callback and a second
+        // sender.stop()/terminate() round are impossible. abortConnection is called from at least two threads
+        // (sender loop and receiver loop), and connectionState is only volatile, so the read+write must be
+        // guarded by this monitor - without synchronization both callers can pass the guard concurrently and
+        // race the follow-up teardown.
+        synchronized (this) {
+            if (connectionState.closingOrDraining()) {
+                return;
+            }
+            if (connectionState == Status.Handshaking) {
+                handshakeError = error.toString();
+            }
+            connectionState = Status.Error;
         }
-        if (connectionState == Status.Handshaking) {
-            handshakeError = error.toString();
-        }
-        connectionState = Status.Error;
 
         if (error != null) {
             log.error("Aborting connection because of error", error);

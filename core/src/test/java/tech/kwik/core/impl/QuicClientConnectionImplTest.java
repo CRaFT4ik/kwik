@@ -833,6 +833,40 @@ class QuicClientConnectionImplTest {
         // Then
         verify(listener, times(1)).disconnected(any(ConnectionTerminatedEvent.class));
     }
+
+    @Test
+    void concurrentAbortConnectionCallsShouldEmitOnlyOneEvent() throws Exception {
+        // Given: two threads race abortConnection - sender loop + receiver loop can both catch a fatal
+        // error and both call abortConnection. Without synchronized guard both callers can pass the
+        // closingOrDraining() check on a volatile field before either has set connectionState = Error,
+        // duplicating the ConnectionTerminatedEvent emit + sender.stop() + terminate() teardown.
+        ConnectionListener listener = mock(ConnectionListener.class);
+        connection.setConnectionListener(listener);
+
+        java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(2);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Runnable racer = () -> {
+            try {
+                barrier.await();
+                connection.abortConnection(new IOException(Thread.currentThread().getName()));
+            } catch (Throwable t) {
+                failure.compareAndSet(null, t);
+            }
+        };
+        Thread t1 = new Thread(racer, "abort-racer-1");
+        Thread t2 = new Thread(racer, "abort-racer-2");
+
+        // When
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+        testScheduledExecutor.check();
+
+        // Then
+        assertThat(failure.get()).isNull();
+        verify(listener, times(1)).disconnected(any(ConnectionTerminatedEvent.class));
+    }
     //endregion
 
     //region misc
