@@ -203,7 +203,11 @@ public class RecoveryManager implements FrameReceivedListener<AckFrame>, Handsha
      * @return a <code>PnSpaceTime</code> object defining the next probe: its time and for which packet number space.
      */
     private PnSpaceTime getPtoTimeAndSpace() {
-        int ptoDuration = rttEstimater.getSmoothedRtt() + Integer.max(1, 4 * rttEstimater.getRttVar());
+        // The `4 * rttVar` term is floored at kGranularity for the same RFC 9002 §6.1.2 reason
+        // LossDetector.detectLostPackets() floors lossDelay: on ultra-fast paths rttVar rounds
+        // to 0 and the PTO would compute to smoothedRtt alone, which is not conservative enough
+        // for a spurious probe suppression on a sub-ms path.
+        int ptoDuration = rttEstimater.getSmoothedRtt() + Integer.max(LossDetector.kGranularity, 4 * rttEstimater.getRttVar());
         ptoDuration *= (int) (Math.pow(2, ptoCount));
 
         // The pseudo code in https://www.rfc-editor.org/rfc/rfc9002.html#name-setting-the-loss-detection- test for

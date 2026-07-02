@@ -284,6 +284,46 @@ class LossDetectorTest extends RecoveryTests {
         assertThat(lossDetector.getLossTime()).isNull();
     }
 
+    /**
+     * Regression: on ultra-fast paths (loopback, sub-ms probes) both smoothed and latest RTT
+     * round to 0. Before the kGranularity floor the computed lossDelay was 0 and the
+     * `assert lossDelay > 0` check inside detectLostPackets tripped with -ea enabled.
+     * The test would surface as an AssertionError on the ACK receive path.
+     */
+    @Test
+    void zeroRttDoesNotThrowAssertionError() {
+        when(rttEstimator.getSmoothedRtt()).thenReturn(0);
+        when(rttEstimator.getLatestRtt()).thenReturn(0);
+
+        lossDetector.packetSent(createPacket(1), clock.instant(), lostPacket -> lostPacketHandler.process(lostPacket));
+
+        // If detectLostPackets computed lossDelay = 0 it would either throw AssertionError
+        // (with -ea) or declare packet 1 lost immediately (without -ea). Both are wrong.
+        lossDetector.onAckReceived(new AckFrame(1L), clock.instant());
+    }
+
+    /**
+     * Regression: with a 0-RTT estimate a just-sent unacked packet would land strictly before
+     * `Instant.now() - 0ms` and get declared lost immediately on the next ACK. The
+     * kGranularity floor pushes the sent-time cutoff back by at least 1 ms so a packet sent
+     * "now" is not spuriously lost.
+     */
+    @Test
+    void zeroRttPacketNotSpuriouslyDeclaredLost() {
+        when(rttEstimator.getSmoothedRtt()).thenReturn(0);
+        when(rttEstimator.getLatestRtt()).thenReturn(0);
+
+        // Two packets sent at the same clock instant; ACK only the second. Under a 0-lossDelay
+        // computation packet 1 (< 3 pns before largestAcked, sent at "now") would be declared
+        // lost via the time-threshold branch. With the kGranularity floor it must NOT be.
+        lossDetector.packetSent(createPacket(1), clock.instant(), lostPacket -> lostPacketHandler.process(lostPacket));
+        lossDetector.packetSent(createPacket(2), clock.instant(), lostPacket -> lostPacketHandler.process(lostPacket));
+
+        lossDetector.onAckReceived(new AckFrame(2L), clock.instant());
+
+        verify(lostPacketHandler, never()).process(any(QuicPacket.class));
+    }
+
     //endregion
 
     //region acks

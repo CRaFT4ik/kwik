@@ -51,7 +51,9 @@ public class LossDetector {
     // Time threshold for lost detection MUST be floored to kGranularity, otherwise on ultra-fast paths
     // (loopback, sub-ms RTT samples that round to 0) lossDelay would compute to 0 and both trip the
     // assertion below AND treat any packet older than "now" as lost, causing spurious retransmits.
-    private static final int kGranularity = 1;
+    // Package-private so RecoveryManager can share the same floor in its PTO formula - the two
+    // RFC 9002 §6.1.2 sites cannot silently diverge on the value.
+    static final int kGranularity = 1;
     private final SortedMap<Long, PacketStatus> packetSentLog;
     private final AtomicInteger ackElicitingInFlight;
     private volatile long largestAcked = -1;
