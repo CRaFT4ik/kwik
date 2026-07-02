@@ -800,6 +800,39 @@ class QuicClientConnectionImplTest {
         assertThat(connectionTerminatedEvent.closedByPeer()).isTrue();
         assertThat(connectionTerminatedEvent.hasApplicationError()).isFalse();
     }
+
+    @Test
+    void abortConnectionShouldEmitConnectionLostEventToListener() throws Exception {
+        // Given
+        ConnectionListener listener = mock(ConnectionListener.class);
+        connection.setConnectionListener(listener);
+
+        // When
+        connection.abortConnection(new IOException("Network is unreachable"));
+        testScheduledExecutor.check();
+
+        // Then
+        ArgumentCaptor<ConnectionTerminatedEvent> eventCaptor = ArgumentCaptor.forClass(ConnectionTerminatedEvent.class);
+        verify(listener).disconnected(eventCaptor.capture());
+        ConnectionTerminatedEvent event = eventCaptor.getValue();
+        assertThat(event.closeReason()).isEqualTo(ConnectionTerminatedEvent.CloseReason.ConnectionLost);
+        assertThat(event.closedByPeer()).isFalse();
+    }
+
+    @Test
+    void abortConnectionCalledTwiceShouldEmitOnlyOneEvent() throws Exception {
+        // Given
+        ConnectionListener listener = mock(ConnectionListener.class);
+        connection.setConnectionListener(listener);
+
+        // When
+        connection.abortConnection(new IOException("first"));
+        connection.abortConnection(new IOException("second"));
+        testScheduledExecutor.check();
+
+        // Then
+        verify(listener, times(1)).disconnected(any(ConnectionTerminatedEvent.class));
+    }
     //endregion
 
     //region misc

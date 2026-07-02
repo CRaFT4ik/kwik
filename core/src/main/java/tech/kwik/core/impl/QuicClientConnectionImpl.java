@@ -1044,11 +1044,21 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
     }
 
     /**
-     * Abort connection due to a fatal error in this client. No message is sent to peer; just inform client it's all over.
+     * Abort connection due to a fatal error in this client. No CONNECTION_CLOSE frame is sent to the peer, but the
+     * registered {@link tech.kwik.core.ConnectionListener} (if any) is notified via a {@link ConnectionTerminatedEvent}
+     * with reason {@link ConnectionTerminatedEvent.CloseReason#ConnectionLost} so an application waiting on the
+     * terminate signal is not left hanging. Symmetric with {@link #silentlyCloseConnection(long)},
+     * {@link #immediateCloseWithError(long, ErrorType, String)} and {@code ServerConnectionImpl.abortConnection}.
      * @param error  the exception that caused the trouble
      */
     @Override
     public void abortConnection(Throwable error) {
+        // Idempotency guard: if the connection is already in a terminal state a previous abort/close path has already
+        // emitted the terminate event (or is about to). Skipping here avoids a duplicate listener callback and a
+        // second sender.stop()/terminate() round.
+        if (connectionState == Status.Error || connectionState == Status.Closed) {
+            return;
+        }
         if (connectionState == Status.Handshaking) {
             handshakeError = error.toString();
         }
@@ -1061,6 +1071,7 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
         sender.stop();
         terminate();
         streamManager.abortAll();
+        emit(new ConnectionTerminatedEvent(this, ConnectionTerminatedEvent.CloseReason.ConnectionLost, false));
     }
 
     // https://tools.ietf.org/html/draft-ietf-quic-transport-19#section-5.1.2
