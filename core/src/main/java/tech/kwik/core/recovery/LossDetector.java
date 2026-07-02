@@ -46,6 +46,12 @@ public class LossDetector {
     private final QLog qLog;
     private final float kTimeThreshold = 9f/8f;
     private final int kPacketThreshold = 3;
+    // https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1.2
+    // "The RECOMMENDED time threshold ... is 9/8. The RECOMMENDED value of the timer granularity ... is 1 ms."
+    // Time threshold for lost detection MUST be floored to kGranularity, otherwise on ultra-fast paths
+    // (loopback, sub-ms RTT samples that round to 0) lossDelay would compute to 0 and both trip the
+    // assertion below AND treat any packet older than "now" as lost, causing spurious retransmits.
+    private static final int kGranularity = 1;
     private final SortedMap<Long, PacketStatus> packetSentLog;
     private final AtomicInteger ackElicitingInFlight;
     private volatile long largestAcked = -1;
@@ -173,8 +179,11 @@ public class LossDetector {
             return;
         }
 
-        int lossDelay = (int) (kTimeThreshold * Integer.max(rttEstimater.getSmoothedRtt(), rttEstimater.getLatestRtt()));
-        assert(lossDelay > 0);  // Minimum time of kGranularity before packets are deemed lost
+        // RFC 9002 §6.1.2: time threshold = max(kTimeThreshold * max(smoothed_rtt, latest_rtt), kGranularity).
+        // The floor at kGranularity is REQUIRED, not just a defensive minimum: with sub-ms RTT samples on loopback
+        // both smoothed_rtt and latest_rtt round down to 0 and the product would compute to 0, in which case every
+        // in-flight packet whose sent time is strictly before "now" would be declared lost on the next ACK.
+        int lossDelay = Integer.max((int) (kTimeThreshold * Integer.max(rttEstimater.getSmoothedRtt(), rttEstimater.getLatestRtt())), kGranularity);
         Instant lostSendTime = Instant.now(clock).minusMillis(lossDelay);
 
         // https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1
